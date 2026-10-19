@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use std::sync::Arc;
-use vtc_core::backend::{Db, DbRef};
+use vtc_core::backend::Db;
 use vtc_core::constants::role;
 use vtc_core::domain::{Team, User};
 use vtc_core::error::AppError;
@@ -46,7 +46,15 @@ impl ServerConfig {
 }
 
 /// 种子：Team（若不存在）+ admin 用户（若不存在）
-pub async fn seed(db: &DbRef, cfg: &ServerConfig) -> Result<()> {
+///
+/// 参数是**具体后端** `Arc<SqliteDb>`（不是 `Arc<dyn Db>`）：直接对 `SqliteDb` 调 `Db` 方法，
+/// 让编译器用 `SqliteDb` 的 `?Send` impl 方法（Send future）。**不**走 `Arc<dyn Db>`——因为
+/// `?Send` trait 的 `dyn Db` 是非 Send 的，在 `async fn` 里 `.await` 它的 future 会触发
+/// async-trait 的"全局 Send 规则"反向污染 `SqliteDb: Db` 的 future（去掉 Send bound），
+/// 让 axum handler 判非 Send。直接调具体类型绕开这个 trap。
+pub async fn seed(db: &Arc<crate::db::SqliteDb>, cfg: &ServerConfig) -> Result<()> {
+    use vtc_core::backend::Db as _; // 让 `SqliteDb` 的 `Db` trait 方法可见
+
     // Team
     if db.get_team().await?.is_none() {
         let team = Team {
@@ -98,7 +106,6 @@ pub async fn seed(db: &DbRef, cfg: &ServerConfig) -> Result<()> {
         tracing::info!("已种子 admin：{}（密码 ADMIN_INITIAL_PASSWORD）", admin.username);
     }
 
-    let _ = db;
     Ok(())
 }
 

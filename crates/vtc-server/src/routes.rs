@@ -11,26 +11,31 @@ use axum::routing::{get, post};
 use axum::Json;
 use std::sync::Arc;
 use vtc_core::auth::jwt::Claims;
-use vtc_core::backend::Backends;
 use vtc_core::constants::{game, role, status};
+use vtc_core::backend::Storage;
 use vtc_core::error::AppError;
 use vtc_core::service::{
     AuthService, ConfigService, ContentService, DlcService, MemberService, SaveService,
 };
 use crate::bootstrap::ServerConfig;
+use crate::db::SqliteDb;
+use crate::push::InMemPush;
+use crate::storage::LocalStorage;
 
-/// 应用状态
+/// 应用状态（具体后端类型：SqliteDb / LocalStorage / InMemPush）
 #[derive(Clone)]
 pub struct AppState {
-    pub backends: Backends,
+    pub db: Arc<SqliteDb>,
+    pub storage: Arc<LocalStorage>,
+    pub push: Arc<InMemPush>,
     pub jwt: Arc<vtc_core::auth::JwtService>,
     pub cfg: ServerConfig,
-    // 服务（共享）
-    pub auth: Arc<AuthService>,
-    pub members: Arc<MemberService>,
-    pub saves: Arc<SaveService>,
-    pub content: Arc<ContentService>,
-    pub dlc: Arc<DlcService>,
+    // 服务（共享，泛型实例化为具体后端类型）
+    pub auth: Arc<AuthService<SqliteDb>>,
+    pub members: Arc<MemberService<SqliteDb>>,
+    pub saves: Arc<SaveService<SqliteDb, LocalStorage>>,
+    pub content: Arc<ContentService<SqliteDb>>,
+    pub dlc: Arc<DlcService<SqliteDb>>,
 }
 
 /// 鉴权提取器：解析 Bearer token → Claims
@@ -53,18 +58,25 @@ impl FromRequestParts<AppState> for AuthUser {
 }
 
 /// 构造路由器
-pub fn build_app(backends: Backends, cfg: ServerConfig) -> axum::Router {
+pub fn build_app(
+    db: Arc<SqliteDb>,
+    storage: Arc<LocalStorage>,
+    push: Arc<InMemPush>,
+    cfg: ServerConfig,
+) -> axum::Router {
     let jwt = Arc::new(vtc_core::auth::JwtService::new(&cfg.jwt_secret));
     let rate = Arc::new(vtc_core::service::rate::RateLimiter::new());
 
-    let auth = Arc::new(AuthService::new(backends.clone(), jwt.clone(), rate.clone(), cfg.require_tmp, cfg.require_steam));
-    let members = Arc::new(MemberService::new(backends.clone(), jwt.clone()));
-    let saves = Arc::new(SaveService::new(backends.clone(), jwt.clone(), cfg.public_base.clone()));
-    let content = Arc::new(ContentService::new(backends.clone(), jwt.clone()));
-    let dlc = Arc::new(DlcService::new(backends.clone(), cfg.map_dlc_dir.clone()));
+    let auth = Arc::new(AuthService::new(db.clone(), jwt.clone(), rate.clone(), cfg.require_tmp, cfg.require_steam));
+    let members = Arc::new(MemberService::new(db.clone(), jwt.clone()));
+    let saves = Arc::new(SaveService::new(db.clone(), storage.clone(), jwt.clone(), cfg.public_base.clone()));
+    let content = Arc::new(ContentService::new(db.clone(), jwt.clone()));
+    let dlc = Arc::new(DlcService::new(db.clone(), cfg.map_dlc_dir.clone()));
 
     let state = AppState {
-        backends,
+        db,
+        storage,
+        push,
         jwt,
         cfg,
         auth,
@@ -103,7 +115,7 @@ pub fn build_app(backends: Backends, cfg: ServerConfig) -> axum::Router {
 async fn health() -> &'static str { "ok" }
 
 async fn cfg_public(State(s): State<AppState>) -> impl IntoResponse {
-    let svc = ConfigService::new(s.backends.clone(), s.cfg.update_channel.clone());
+    let svc = ConfigService::new(s.db.clone(), s.cfg.update_channel.clone());
     match svc.get_public().await {
         Ok(v) => Json(v).into_response(),
         Err(e) => err_response(&e),
@@ -168,14 +180,14 @@ async fn dlc_map_template(State(s): State<AppState>, AuthUser(_c): AuthUser, Que
 }
 
 async fn storage_upload(State(s): State<AppState>, Query(q): Query<StorageQs>, body: Bytes) -> impl IntoResponse {
-    match s.backends.storage.local_access("PUT", &q.key, Some(body.to_vec())).await {
+    match s.storage.local_access("PUT", &q.key, Some(body.to_vec())).await {
         Ok((_, ct, st)) => (StatusCode::from_u16(st).unwrap_or(StatusCode::OK), ct).into_response(),
         Err(e) => err_response(&e),
     }
 }
 
 async fn storage_download(State(s): State<AppState>, Query(q): Query<StorageQs>) -> impl IntoResponse {
-    match s.backends.storage.local_access("GET", &q.key, None).await {
+    match s.storage.local_access("GET", &q.key, None).await {
         Ok((b, ct, st)) => {
             Response::builder()
                 .status(StatusCode::from_u16(st).unwrap_or(StatusCode::OK))

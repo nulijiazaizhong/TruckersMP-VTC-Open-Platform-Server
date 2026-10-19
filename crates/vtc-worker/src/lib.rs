@@ -21,17 +21,17 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use vtc_core::auth::jwt::Claims;
-use vtc_core::backend::Backends;
+use vtc_core::backend::Storage;
 use vtc_core::dto;
 use vtc_core::error::AppError;
 use vtc_core::service::{
     AuthService, ConfigService, ContentService, MemberService, RateLimiter, SaveService,
 };
-// 注意（worker 0.8.6）：
+// 注意（worker 0.8.6 导出）：
 // - `#[worker::event(fetch)]` 的第三个参数是**原始** `worker_sys::Context`（宏内部再 `worker::Context::new`），
 //   这里签名必须用 `worker_sys::Context` 而不是包装后的 `worker::Context`。
-// - `Bucket`/`D1Database`/`Method`/`Headers` 在顶层 re-export；`JsValue` 在 `worker::js_sys`（worker 转导出 js_sys）。
-use worker::js_sys::JsValue;
+// - `Bucket`/`D1Database`/`Method`/`Headers` 在顶层 re-export。
+//   `JsValue` 在 `worker::js_sys`（worker **不**在顶层 re-export JsValue，只 re-export js_sys 模块）。
 use worker::{
     d1::D1Database, worker_sys, Bucket, Error, Headers, Method, Response, Request,
 };
@@ -121,32 +121,32 @@ async fn fetch(req: Request, ctx: Context) -> Result<Response, Error> {
     // 去掉 /api/v1 前缀
     let path = path.strip_prefix("/api/v1").unwrap_or(&path).to_string();
 
-    // 装配后端（D1 + R2；Push 内存存根）
+    // 装配后端（D1 + R2；Push 内存存根）。
+    // service 层已泛型化（不持 Backends/dyn），worker 把**具体** `Arc<D1Database>` /
+    // `Arc<R2Storage>` / `Arc<InMemPush>` 传给各 service 的 `new()`。
     let d1: D1Database = ctx.d1(D1_BINDING)?;
     let bucket: Bucket = ctx.get_binding::<Bucket>(R2_BINDING)?;
     let cfg = worker_config();
     let (jwt, rate) = worker_services(&cfg);
-    let backends = Backends {
-        db: Arc::new(d1),
-        storage: Arc::new(storage::R2Storage::new(bucket, &cfg.public_base)),
-        push: Arc::new(push::InMemPush::new()),
-    };
+    let db: Arc<D1Database> = Arc::new(d1);
+    let storage: Arc<storage::R2Storage> = Arc::new(storage::R2Storage::new(bucket, &cfg.public_base));
+    let _push: Arc<push::InMemPush> = Arc::new(push::InMemPush::new()); // P0 存根，未用于 service
 
     // 1) storage 中转（/api/v1/storage/*，HMAC sig 鉴权，无需 Bearer）
     if path == "/storage/upload" && method == Method::Put {
         let qs = parse_qs::<StorageQs>(&query);
-        return storage_transit(&backends.storage, &qs.key, "PUT", Some(req.bytes().await.unwrap_or_default())).await;
+        return storage_transit(&storage, &qs.key, "PUT", Some(req.bytes().await.unwrap_or_default())).await;
     }
     if path == "/storage/download" && method == Method::Get {
         let qs = parse_qs::<StorageQs>(&query);
-        return storage_transit(&backends.storage, &qs.key, "GET", None).await;
+        return storage_transit(&storage, &qs.key, "GET", None).await;
     }
 
     // 2) 无鉴权
     match (path.as_str(), method) {
         ("/health", Method::Get) => return text(200, "ok"),
         ("/config/public", Method::Get) => {
-            let svc = ConfigService::new(backends, cfg.update_channel);
+            let svc = ConfigService::new(db.clone(), cfg.update_channel);
             return match svc.get_public().await {
                 Ok(v) => ok_json(&v),
                 Err(e) => err_json(&e),
@@ -154,7 +154,7 @@ async fn fetch(req: Request, ctx: Context) -> Result<Response, Error> {
         }
         ("/auth/login", Method::Post) => {
             let body: dto::auth::AuthLoginDto = req.json().await.unwrap_or_default();
-            let auth = AuthService::new(backends, jwt, rate, cfg.require_tmp, cfg.require_steam);
+            let auth = AuthService::new(db.clone(), jwt.clone(), rate.clone(), cfg.require_tmp, cfg.require_steam);
             return match auth.login(&body, "127.0.0.1").await {
                 Ok(v) => ok_json(&v),
                 Err(e) => err_json(&e),
@@ -162,7 +162,7 @@ async fn fetch(req: Request, ctx: Context) -> Result<Response, Error> {
         }
         ("/auth/refresh", Method::Post) => {
             let body: dto::auth::AuthRefreshDto = req.json().await.unwrap_or_default();
-            let auth = AuthService::new(backends, jwt, rate, cfg.require_tmp, cfg.require_steam);
+            let auth = AuthService::new(db.clone(), jwt, rate, cfg.require_tmp, cfg.require_steam);
             return match auth.refresh(&body.refresh_token, "127.0.0.1").await {
                 Ok(v) => ok_json(&v),
                 Err(e) => err_json(&e),
@@ -191,7 +191,7 @@ async fn fetch(req: Request, ctx: Context) -> Result<Response, Error> {
     match (path.as_str(), method) {
         ("/members", Method::Get) => {
             let qs = parse_qs::<Qs>(&query);
-            let members = MemberService::new(backends, jwt);
+            let members = MemberService::new(db.clone(), jwt);
             match members.list(qs.take, qs.skip, qs.search.as_deref()).await {
                 Ok((items, total)) => ok_json(&dto::PageResult { items, total, page: qs.page, page_size: qs.take }),
                 Err(e) => err_json(&e),

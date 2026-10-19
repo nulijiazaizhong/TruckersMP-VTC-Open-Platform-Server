@@ -18,7 +18,7 @@ impl InMemPush {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl vtc_core::backend::Push for InMemPush {
     async fn publish(&self, channel: &str, payload: &str) -> AppResult<()> {
         self.latest.write().unwrap().insert(channel.to_string(), payload.to_string());

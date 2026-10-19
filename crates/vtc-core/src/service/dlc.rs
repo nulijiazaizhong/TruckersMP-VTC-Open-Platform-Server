@@ -1,22 +1,24 @@
 //! DLC 服务（S6）：模板加载 / 状态上报 / 禁用计划 / 清单
 //! 地图类整名匹配由**客户端**执行；平台只发计划 + 审计 + 备份清单（§3.8）
 
-use crate::backend::Backends;
+use crate::backend::Db;
 use crate::constants::{audit, game};
 use crate::domain::{DlcEntry, DlcReport, DlcState};
 use crate::dto::dlc::{DlcDisablePlan, DlcDisableReq, DlcMapTemplate, DlcRequiredDto};
 use crate::error::{AppError, AppResult};
 use std::path::Path;
+use std::sync::Arc;
 
-pub struct DlcService {
-    pub backends: Backends,
+/// DLC 服务：泛型 over `Db`（只依赖 db），持有具体 `Arc<D>`。
+pub struct DlcService<D: Db> {
+    pub db: Arc<D>,
     /// 地图 DLC 模板目录（map-dlc/），含 <major>.<game>.txt
     pub template_dir: String,
 }
 
-impl DlcService {
-    pub fn new(backends: Backends, template_dir: String) -> Self {
-        DlcService { backends, template_dir }
+impl<D: Db> DlcService<D> {
+    pub fn new(db: Arc<D>, template_dir: String) -> Self {
+        DlcService { db, template_dir }
     }
 
     /// 加载某大版本+游戏的地图类文件名清单（行数组）
@@ -39,7 +41,7 @@ impl DlcService {
 
     /// 车队要求 DLC 列表（GET /dlc/required）
     pub async fn required(&self, gamename: &str, major: &str) -> AppResult<Vec<DlcRequiredDto>> {
-        let entries = self.backends.db.list_dlc_required(gamename, major).await?;
+        let entries = self.db.list_dlc_required(gamename, major).await?;
         Ok(entries
             .into_iter()
             .map(|e| DlcRequiredDto {
@@ -62,7 +64,7 @@ impl DlcService {
             installed: serde_json::to_string(installed).unwrap_or_default(),
             reported_at: chrono::Utc::now(),
         };
-        self.backends.db.insert_dlc_report(&rep).await
+        self.db.insert_dlc_report(&rep).await
     }
 
     /// 生成禁用计划（POST /dlc/disable）
@@ -94,8 +96,7 @@ impl DlcService {
         let backup_dir = format!("dlc_stash/{}/{}", req.game, ts);
 
         // 审计（disable 是客户端执行的，平台记"已下发计划"）
-        self.backends
-            .db
+        self.db
             .insert_audit(&crate::domain::AuditLog {
                 id: uuid::Uuid::new_v4().to_string(),
                 actor: actor.into(),
@@ -116,8 +117,7 @@ impl DlcService {
 
     /// 还原审计（客户端还原后上报）
     pub async fn report_restore(&self, actor: &str, ip: &str, game: &str, restored: &[String]) -> AppResult<()> {
-        self.backends
-            .db
+        self.db
             .insert_audit(&crate::domain::AuditLog {
                 id: uuid::Uuid::new_v4().to_string(),
                 actor: actor.into(),

@@ -1,0 +1,14 @@
+F:\ds-harness-workspace\ETS2 TruckersMP P0\vtc-rs\tmp_probe\target\debug\deps\serde-b953699c1a545dca.d: C:\Users\bi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\lib.rs C:\Users\bi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\integer128.rs C:\Users\bi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\mod.rs C:\Users\bi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\de.rs C:\Users\bi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\ser.rs F:\ds-harness-workspace\ETS2\ TruckersMP\ P0\vtc-rs\tmp_probe\target\debug\build\serde-31ebab7bb4a6eab8\out/private.rs
+
+F:\ds-harness-workspace\ETS2 TruckersMP P0\vtc-rs\tmp_probe\target\debug\deps\libserde-b953699c1a545dca.rlib: C:\Users\bi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\lib.rs C:\Users\bi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\integer128.rs C:\Users\bi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\mod.rs C:\Users\bi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\de.rs C:\Users\bi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\ser.rs F:\ds-harness-workspace\ETS2\ TruckersMP\ P0\vtc-rs\tmp_probe\target\debug\build\serde-31ebab7bb4a6eab8\out/private.rs
+
+F:\ds-harness-workspace\ETS2 TruckersMP P0\vtc-rs\tmp_probe\target\debug\deps\libserde-b953699c1a545dca.rmeta: C:\Users\bi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\lib.rs C:\Users\bi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\integer128.rs C:\Users\bi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\mod.rs C:\Users\bi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\de.rs C:\Users\bi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\ser.rs F:\ds-harness-workspace\ETS2\ TruckersMP\ P0\vtc-rs\tmp_probe\target\debug\build\serde-31ebab7bb4a6eab8\out/private.rs
+
+C:\Users\bi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\lib.rs:
+C:\Users\bi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\integer128.rs:
+C:\Users\bi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\mod.rs:
+C:\Users\bi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\de.rs:
+C:\Users\bi\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\ser.rs:
+F:\ds-harness-workspace\ETS2\ TruckersMP\ P0\vtc-rs\tmp_probe\target\debug\build\serde-31ebab7bb4a6eab8\out/private.rs:
+
+# env-dep:OUT_DIR=F:\\ds-harness-workspace\\ETS2 TruckersMP P0\\vtc-rs\\tmp_probe\\target\\debug\\build\\serde-31ebab7bb4a6eab8\\out

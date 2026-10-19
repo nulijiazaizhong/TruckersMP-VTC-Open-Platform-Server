@@ -10,7 +10,9 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use worker::d1::D1Database;
-use worker::JsValue;
+// worker 0.8.6 **不**在顶层 re-export `JsValue`（只 re-export `js_sys` 模块），
+// 故走 `worker::js_sys::JsValue`（即 wasm-bindgen 的 JsValue）。
+use worker::js_sys::JsValue;
 use std::sync::Arc;
 use vtc_core::domain::{
     Announcement, AuditLog, DlcEntry, DlcReport, DlcState, Event, Member, RefreshToken, SaveFile,
@@ -250,7 +252,7 @@ fn team_from_row(a: &[JsValue]) -> Team {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl vtc_core::backend::Db for Arc<D1Database> {
     // ---------- 用户 ----------
     async fn get_user_by_username(&self, username: &str) -> AppResult<Option<User>> {

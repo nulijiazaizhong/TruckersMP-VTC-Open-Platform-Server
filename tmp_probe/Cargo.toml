@@ -1,0 +1,11 @@
+[package]
+name = "tmp_probe"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1"
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+
+[workspace]

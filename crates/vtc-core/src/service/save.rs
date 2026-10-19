@@ -1,7 +1,7 @@
 //! 存档服务（S5）：元数据 + 直传凭证 + 发布 + 下载
 //! 大文件走预签名 URL，不落库、不走 API 中转（§3.5）
 
-use crate::backend::Backends;
+use crate::backend::{Db, Storage};
 use crate::constants::{audit, status};
 use crate::domain::{SaveFile, SaveRelease};
 use crate::dto::save::{
@@ -14,16 +14,18 @@ use std::sync::Arc;
 /// 预签名 URL 时效（秒）
 const PRESIGN_TTL: i64 = 3600;
 
-pub struct SaveService {
-    pub backends: Backends,
+/// 存档服务：泛型 over `Db` + `Storage`，持有具体 `Arc<D>` / `Arc<S>`。
+pub struct SaveService<D: Db, S: Storage> {
+    pub db: Arc<D>,
+    pub storage: Arc<S>,
     pub jwt: Arc<crate::auth::JwtService>,
     /// 外部基址（local 形态拼本地端点用；CF 形态不用）
     pub public_base: String,
 }
 
-impl SaveService {
-    pub fn new(backends: Backends, jwt: Arc<crate::auth::JwtService>, public_base: String) -> Self {
-        SaveService { backends, jwt, public_base }
+impl<D: Db, S: Storage> SaveService<D, S> {
+    pub fn new(db: Arc<D>, storage: Arc<S>, jwt: Arc<crate::auth::JwtService>, public_base: String) -> Self {
+        SaveService { db, storage, jwt, public_base }
     }
 
     fn to_dto(s: &SaveFile, url: Option<String>) -> SaveFileDto {
@@ -45,7 +47,7 @@ impl SaveService {
         let save_id = uuid::Uuid::new_v4().to_string();
         // storage key: saves/<game>/<version>/<saveId>.zip
         let key = format!("saves/{}/{}{}.zip", req.game, req.game_version, save_id);
-        let upload_url = self.backends.storage.presign_upload(&key, req.size).await?;
+        let upload_url = self.storage.presign_upload(&key, req.size).await?;
 
         // 先落"未发布"元数据（上传完成后 publish）
         let save = SaveFile {
@@ -61,7 +63,7 @@ impl SaveService {
             created_at: Utc::now(),
             created_by: actor.into(),
         };
-        self.backends.db.insert_save(&save).await?;
+        self.db.insert_save(&save).await?;
         self.audit(actor, "save.create", ip, &save_id).await;
 
         Ok(SaveCredentialDto {
@@ -75,7 +77,6 @@ impl SaveService {
     /// 发布
     pub async fn publish(&self, save_id: &str, req: &PublishReq, actor: &str, ip: &str) -> AppResult<SaveFileDto> {
         let mut s = self
-            .backends
             .db
             .get_save_by_id(save_id)
             .await?
@@ -83,9 +84,8 @@ impl SaveService {
         // 幂等
         if !s.published {
             s.published = true;
-            self.backends.db.set_save_published(save_id, true).await?;
-            self.backends
-                .db
+            self.db.set_save_published(save_id, true).await?;
+            self.db
                 .insert_save_release(&SaveRelease {
                     id: uuid::Uuid::new_v4().to_string(),
                     save_id: save_id.into(),
@@ -96,16 +96,16 @@ impl SaveService {
                 .await?;
             self.audit(actor, audit::SAVE_PUBLISH, ip, save_id).await;
         }
-        let url = self.backends.storage.presign_download(&s.storage_key).await?;
+        let url = self.storage.presign_download(&s.storage_key).await?;
         Ok(Self::to_dto(&s, Some(url)))
     }
 
     /// 列表（按 game + 大版本过滤，仅 published）
     pub async fn list(&self, game: Option<&str>, version_major: Option<&str>, take: i64, skip: i64) -> AppResult<(Vec<SaveFileDto>, i64)> {
-        let (saves, total) = self.backends.db.list_saves(game, version_major, take, skip).await?;
+        let (saves, total) = self.db.list_saves(game, version_major, take, skip).await?;
         let mut dtos = Vec::with_capacity(saves.len());
         for s in &saves {
-            let url = if s.published { Some(self.backends.storage.presign_download(&s.storage_key).await?) } else { None };
+            let url = if s.published { Some(self.storage.presign_download(&s.storage_key).await?) } else { None };
             dtos.push(Self::to_dto(s, url));
         }
         Ok((dtos, total))
@@ -114,7 +114,6 @@ impl SaveService {
     /// 下载凭证（需登录）
     pub async fn issue_download(&self, save_id: &str, _req: &SaveDownloadReq, user_id: &str) -> AppResult<SaveDownloadCredentialDto> {
         let s = self
-            .backends
             .db
             .get_save_by_id(save_id)
             .await?
@@ -122,8 +121,8 @@ impl SaveService {
         if !s.published {
             return Err(AppError::NotFound("存档未发布".into()));
         }
-        let url = self.backends.storage.presign_download(&s.storage_key).await?;
-        self.backends.db.bump_save_downloads(save_id).await?;
+        let url = self.storage.presign_download(&s.storage_key).await?;
+        self.db.bump_save_downloads(save_id).await?;
         let _ = user_id;
         Ok(SaveDownloadCredentialDto {
             download_url: url,
@@ -135,17 +134,16 @@ impl SaveService {
     /// 删除
     pub async fn delete(&self, save_id: &str, actor: &str, ip: &str) -> AppResult<()> {
         // 删对象存储（best-effort）+ 元数据
-        if let Some(s) = self.backends.db.get_save_by_id(save_id).await? {
+        if let Some(s) = self.db.get_save_by_id(save_id).await? {
             let _ = s;
         }
-        self.backends.db.delete_save(save_id).await?;
+        self.db.delete_save(save_id).await?;
         self.audit(actor, audit::SAVE_DELETE, ip, save_id).await;
         Ok(())
     }
 
     async fn audit(&self, actor: &str, action: &str, ip: &str, target: &str) {
         if let Err(e) = self
-            .backends
             .db
             .insert_audit(&crate::domain::AuditLog {
                 id: uuid::Uuid::new_v4().to_string(),

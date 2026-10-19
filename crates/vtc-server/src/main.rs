@@ -12,7 +12,6 @@ mod bootstrap;
 use anyhow::Result;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
-use vtc_core::backend::{Backends, DbRef, PushRef, StorageRef};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -29,20 +28,18 @@ async fn main() -> Result<()> {
     // 1) DB
     let sqlite = db::SqliteDb::open(&cfg.db_path)?;
     sqlite.migrate()?;
-    let db: DbRef = Arc::new(sqlite);
-    // 种子
+    let db: Arc<db::SqliteDb> = Arc::new(sqlite);
+    // 种子（借用 Db 视图）
     bootstrap::seed(&db, &cfg).await?;
 
     // 2) Storage
-    let storage: StorageRef = Arc::new(storage::LocalStorage::new(&cfg.storage_dir, &cfg.public_base));
+    let storage: Arc<storage::LocalStorage> = Arc::new(storage::LocalStorage::new(&cfg.storage_dir, &cfg.public_base));
 
     // 3) Push
-    let push: PushRef = Arc::new(push::InMemPush::new());
-
-    let backends = Backends { db, storage, push };
+    let push: Arc<push::InMemPush> = Arc::new(push::InMemPush::new());
 
     // 4) 路由
-    let app = routes::build_app(backends, cfg.clone());
+    let app = routes::build_app(db, storage, push, cfg.clone());
 
     // 5) 起服务
     let addr = format!("0.0.0.0:{}", cfg.port);

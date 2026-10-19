@@ -1,7 +1,7 @@
 //! 认证服务（S1）：登录 / 刷新 / 会话 / 审计 / 限流
 
 use crate::auth::{jwt::Claims, JwtService};
-use crate::backend::Backends;
+use crate::backend::Db;
 use crate::constants::{audit, role, status};
 use crate::domain::RefreshToken;
 use crate::dto::auth::{AuthLoginDto, AuthLoginResultDto, AuthMemberDto, AuthUserDto};
@@ -10,8 +10,9 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
 
-pub struct AuthService {
-    pub backends: Backends,
+/// 认证服务：泛型 over `Db`（只依赖 db），持有具体 `Arc<D>`。
+pub struct AuthService<D: Db> {
+    pub db: Arc<D>,
     pub jwt: Arc<JwtService>,
     pub rate: Arc<crate::service::rate::RateLimiter>,
     /// 是否启用 TMP / Steam 身份绑定校验
@@ -19,15 +20,15 @@ pub struct AuthService {
     pub require_steam: bool,
 }
 
-impl AuthService {
+impl<D: Db> AuthService<D> {
     pub fn new(
-        backends: Backends,
+        db: Arc<D>,
         jwt: Arc<JwtService>,
         rate: Arc<crate::service::rate::RateLimiter>,
         require_tmp: bool,
         require_steam: bool,
     ) -> Self {
-        AuthService { backends, jwt, rate, require_tmp, require_steam }
+        AuthService { db, jwt, rate, require_tmp, require_steam }
     }
 
     fn hash_token(t: &str) -> String {
@@ -45,7 +46,6 @@ impl AuthService {
         {
             // 审计失败
             let _ = self
-                .backends
                 .db
                 .insert_audit(&crate::domain::AuditLog {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -61,7 +61,6 @@ impl AuthService {
         }
 
         let user = self
-            .backends
             .db
             .get_user_by_username(&req.username)
             .await?
@@ -94,9 +93,8 @@ impl AuthService {
         let refresh = self.jwt.issue_refresh(&user.id, &user.username)?;
 
         // 存 refresh（旧的同用户 refresh 全部吊销 → 轮换）
-        self.backends.db.revoke_all_for_user(&user.id).await?;
-        self.backends
-            .db
+        self.db.revoke_all_for_user(&user.id).await?;
+        self.db
             .insert_refresh_token(&RefreshToken {
                 id: uuid::Uuid::new_v4().to_string(),
                 token_hash: Self::hash_token(&refresh),
@@ -110,14 +108,13 @@ impl AuthService {
             .await?;
 
         // 更新 last_login + 审计
-        self.backends
-            .db
+        self.db
             .update_user_last_login(&user.id, chrono::Utc::now())
             .await?;
         self.audit(&user.username, audit::LOGIN, ip, "ok").await;
 
         // 组装响应
-        let member = self.backends.db.get_member_by_user(&user.id).await?;
+        let member = self.db.get_member_by_user(&user.id).await?;
         let result = AuthLoginResultDto {
             access_token: access,
             refresh_token: refresh,
@@ -142,7 +139,6 @@ impl AuthService {
     pub async fn refresh(&self, refresh_token: &str, ip: &str) -> AppResult<AuthLoginResultDto> {
         let thash = Self::hash_token(refresh_token);
         let stored = self
-            .backends
             .db
             .get_refresh_token(&thash)
             .await?
@@ -150,7 +146,7 @@ impl AuthService {
 
         if stored.revoked_at.is_some() {
             // 重放攻击：吊销该用户所有
-            self.backends.db.revoke_all_for_user(&stored.user_id).await?;
+            self.db.revoke_all_for_user(&stored.user_id).await?;
             return Err(AppError::Unauthorized("refresh token 已被吊销（疑似重放）".into()));
         }
         if stored.expires_at < chrono::Utc::now() {
@@ -158,7 +154,6 @@ impl AuthService {
         }
 
         let user = self
-            .backends
             .db
             .get_user_by_id(&stored.user_id)
             .await?
@@ -171,12 +166,10 @@ impl AuthService {
         let new_hash = Self::hash_token(&new_refresh);
 
         // 轮换：旧吊销 + 指向新
-        self.backends
-            .db
+        self.db
             .revoke_refresh_token(&thash, Some(&new_hash))
             .await?;
-        self.backends
-            .db
+        self.db
             .insert_refresh_token(&RefreshToken {
                 id: uuid::Uuid::new_v4().to_string(),
                 token_hash: new_hash,
@@ -189,7 +182,7 @@ impl AuthService {
             .await?;
         self.audit(&user.username, audit::REFRESH, ip, "ok").await;
 
-        let member = self.backends.db.get_member_by_user(&user.id).await?;
+        let member = self.db.get_member_by_user(&user.id).await?;
         Ok(AuthLoginResultDto {
             access_token: access,
             refresh_token: new_refresh,
@@ -216,7 +209,6 @@ impl AuthService {
 
     async fn audit(&self, actor: &str, action: &str, ip: &str, detail: &str) {
         if let Err(e) = self
-            .backends
             .db
             .insert_audit(&crate::domain::AuditLog {
                 id: uuid::Uuid::new_v4().to_string(),

@@ -62,7 +62,7 @@ impl R2Storage {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl vtc_core::backend::Storage for R2Storage {
     async fn presign_upload(&self, key: &str, _size: i64) -> AppResult<String> {
         let sig = self.sign(key, "PUT");

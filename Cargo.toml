@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = ["crates/vtc-core", "crates/vtc-server", "crates/vtc-worker"]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# --- 共享核心 ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "2"
+
+# --- 认证 / 安全 ---
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.9"
+hmac = "0.12"
+
+# --- 时间 ---
+chrono = { version = "0.4", features = ["serde"] }
+time = { version = "0.3", features = ["serde", "macros"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+
+# --- 持久化（Docker 形态） ---
+# 注意：bundled=false，使用预编译 sqlite3.lib（sandbox 下 MSVC cl 无法被 cc-rs 调用）
+# 预编译库在 vtc-rs/prebuilt/sqlite3.lib，通过 SQLITE3_LIB_DIR + SQLITE3_STATIC 注入
+rusqlite = { version = "0.32" }
+serde_urlencoded = "0.7"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

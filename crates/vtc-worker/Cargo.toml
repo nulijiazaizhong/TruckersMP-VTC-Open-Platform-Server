@@ -1,0 +1,43 @@
+[package]
+name = "vtc-worker"
+description = "VTC 服务端 · Cloudflare Workers 形态（worker crate + D1 + R2 + Durable Objects）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[lib.rustc]
+# worker crate 要求 wasi-target 下启用
+[target.wasm32-wasip2.dependencies]
+# 固定 0.8.6：0.8.7 把 MSRV 提到 rustc 1.91（本机 1.89 不支持），0.8.6/0.8.5 的 MSRV=1.75 且 API 一致
+# features：d1（worker-sys/d1，D1 模块）、http（worker-macros/http，http 模块）；r2 在 0.8.6 无 feature 门控（始终可用）
+worker = { version = "=0.8.6", features = ["d1", "http"] }
+worker-macros = "=0.8.6"
+console_error_panic_hook = "0.1"
+
+[dependencies]
+vtc-core = { path = "../vtc-core" }
+# 注意：worker 形态**不**直接依赖 tokio/workspace(tokio features=["full"])——
+# tokio 的 full 在 wasm32-wasip2 上 compile_error（只支持 sync/macros/io-util/rt/time）。
+# worker crate 自身会按 wasm 兼容特性引入 tokio，vtc-worker 代码不需要 tokio 直接依赖。
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_urlencoded = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+async-trait = "0.1"
+futures = "0.3"
+tracing = { workspace = true }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

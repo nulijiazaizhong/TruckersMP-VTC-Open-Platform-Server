@@ -1,0 +1,29 @@
+# Rust
+/target
+**/*.rs.bk
+# Cargo.lock 对 server 二进制应提交（可复现构建）
+
+# 预编译 SQLite（本机产物，CI/容器内用 bundled 或系统库重建；不入库）
+/prebuilt
+
+# 运行时数据
+*.db
+*.db-wal
+*.db-shm
+/storage/
+smoke-*.log
+smoke-test*
+
+# 环境 / 机密
+.env
+.env.local
+.env.*.local
+
+# 编辑器
+.vs/
+.vscode/
+.idea/
+*.swp
+
+# wrangler 状态
+.wrangler/

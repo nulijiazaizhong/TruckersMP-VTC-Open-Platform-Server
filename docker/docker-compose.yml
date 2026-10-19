@@ -1,0 +1,54 @@
+# VTC 服务端 · Rust · Docker Compose
+# 与 .NET 版共用同一套 .env / map-dlc（上层 ../map-dlc）
+
+services:
+  vtc-api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: vtc-rs/api:latest
+    ports:
+      - "${PORT:-8731}:8731"
+    environment:
+      - JWT_SECRET=${JWT_SECRET}
+      - PORT=${PORT:-8731}
+      - DB_PATH=${DB_PATH:-/data/vtc.db}
+      - STORAGE_DIR=${STORAGE_DIR:-/data/storage}
+      - PUBLIC_BASE=${PUBLIC_BASE:-http://127.0.0.1:8731}
+      - MAP_DLC_DIR=${MAP_DLC_DIR:-/app/map-dlc}
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_INITIAL_PASSWORD=${ADMIN_INITIAL_PASSWORD:-ChangeMe123!}
+      - TEAM_NAME=${TEAM_NAME:-默认车队}
+      - UPDATE_CHANNEL=${UPDATE_CHANNEL:-stable}
+      - RUST_LOG=${RUST_LOG:-info}
+    volumes:
+      - vtc-data:/data
+    restart: unless-stopped
+    # 健康检查：distroless 无 shell/curl，用平台层 TCP 探测（此处留空，
+    # 生产建议 K8s livenessProbe tcpSocket:8731 或加 curl sidecar httpGet /api/v1/health）
+
+  # 可选：PostgreSQL（P1，当前 SQLite 单机足够）
+  # vtc-db:
+  #   image: postgres:16-alpine
+  #   profiles: ["postgres"]
+  #   environment:
+  #     POSTGRES_DB: vtc
+  #     POSTGRES_USER: vtc
+  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  #   volumes: [vtc-pg:/var/lib/postgresql/data]
+
+  # 可选：MinIO 对象存储（P1，替代本地存储 / S3）
+  # minio:
+  #   image: minio/minio
+  #   profiles: ["minio"]
+  #   command: server /data --console-address ":9001"
+  #   ports: ["9000:9000", "9001:9001"]
+  #   environment:
+  #     MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+  #     MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+  #   volumes: [vtc-minio:/data]
+
+volumes:
+  vtc-data:
+  # vtc-pg:
+  # vtc-minio:

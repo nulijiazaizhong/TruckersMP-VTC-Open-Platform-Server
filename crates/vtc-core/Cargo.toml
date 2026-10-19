@@ -1,0 +1,41 @@
+[package]
+name = "vtc-core"
+description = "VTC 车队管理平台 · 核心（DTO / 常量 / 错误码 / Domain / 可插拔后端抽象）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# core 同时被 docker(axum) 与 cf(worker) 两个二进制链接
+path = "src/lib.rs"
+
+[features]
+default = []
+# worker 形态：启用 worker crate 相关的 D1/R2/DO 绑定桥接（由 vtc-worker 开启）
+worker = []
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# 注意：core 的 service 代码只用 std::future（async trait），**不**直接依赖 tokio / futures。
+# - tokio 由各形态 crate 自己声明（vtc-server 用 features=full；vtc-worker 由 worker crate 按 wasm 兼容特性引入）。
+# - vtc-core **不能**声明 `tokio = { workspace = true }`（workspace 是 full），否则特征统一会把
+#   full 灌进 vtc-worker 的 wasm32-wasip2 图，触发 tokio 的 `Only features sync,macros,io-util,rt,time supported on wasm`。
+# - vtc-core 也**不能**依赖 axum：axum→hyper 会引入 tokio/net，worker 形态（wasm32-wasip2）下
+#   tokio 不支持 net → 编译失败。core 的 service 是 backend-agnostic，只用 std::future（async trait），
+#   不依赖 axum；两个 crate 各自的 web 层（vtc-server=Axum / vtc-worker=worker）不经过 core。
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+hmac = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+# async-trait：让 trait 方法能 async + 被 Box<dyn> 持有（双后端可插拔的关键）
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }

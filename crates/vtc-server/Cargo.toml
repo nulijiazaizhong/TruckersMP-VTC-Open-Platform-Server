@@ -1,0 +1,34 @@
+[package]
+name = "vtc-server"
+description = "VTC 服务端 · Docker 自部署形态（Axum + SQLite + 本地/S3 + 内存推送）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vtc-server"
+path = "src/main.rs"
+
+[dependencies]
+vtc-core = { path = "../vtc-core" }
+axum = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+rusqlite = { workspace = true }
+rand = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+async-trait = "0.1"
+futures = "0.3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

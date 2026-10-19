@@ -1,0 +1,64 @@
+{
+  // VTC 服务端 · Cloudflare Workers 部署配置（worker-rs / wasi，wasm32-wasip2）
+  // 构建：cargo build -p vtc-worker --target wasm32-wasip2 --release
+  // 部署：在 crates/vtc-worker/ 下 `wrangler deploy`
+  // 前提资源：
+  //   wrangler d1 create vtc          → 填 database_id
+  //   wrangler r2 bucket create vtc-saves
+  "name": "vtc-server",
+  "main": "src/lib.rs",
+  "compatibility_date": "2025-08-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "observability": { "enabled": true },
+
+  // 正式域名路由（/api/* 与 /storage/* 都打到 worker 的 fetch 事件，见 src/lib.rs）
+  "routes": [
+    { "pattern": "vtc.example.com/api/*", "zone_id": "<ZONE_ID>", "zone_name": "example.com", "custom_domain": false },
+    { "pattern": "vtc.example.com/storage/*", "zone_id": "<ZONE_ID>", "zone_name": "example.com", "custom_domain": false }
+  ],
+
+  // 绑定（wrangler 3.x 统一用 bindings 数组；binding 名与 src/lib.rs 的 D1_BINDING/R2_BINDING 对应）
+  "bindings": [
+    // D1 关系型 SQL（= SQLite 方言；db.rs 的 D1Db）
+    {
+      "binding": "DB",
+      "type": "d1",
+      "database_name": "vtc",
+      "database_id": "<D1_DATABASE_ID>",
+      "migrations_dir": "migrations"
+    },
+    // R2 对象存储（storage.rs 的 R2Storage）
+    {
+      "binding": "BUCKET",
+      "type": "r2-bucket",
+      "bucket_name": "vtc-saves"
+    },
+    // Durable Objects（P1：事件推送/会话；P0 用内存 InMemPush 占位，此处保留占位绑定）
+    {
+      "binding": "PUSH",
+      "type": "durable_object",
+      "class_name": "PushRoom"
+    }
+  ],
+
+  // 环境变量（非机密；机密如 JWT_SECRET 用 `wrangler secret put JWT_SECRET`）
+  "vars": {
+    "TEAM_NAME": "默认车队",
+    "UPDATE_CHANNEL": "stable",
+    "MAP_DLC_DIR": "map-dlc",
+    "STORAGE_PROVIDER": "r2",
+    "PUBLIC_BASE": "https://vtc.example.com",
+    "AUTH_REQUIRE_TMP": "false",
+    "AUTH_REQUIRE_STEAM": "false"
+  },
+
+  // D1 迁移（启用 SQLite 函数/类；建表 SQL 也在 src/db.rs 的 MIGRATE_SQL，冷启动 ensure_schema 幂等执行）
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_functions": true,
+      "new_sqlite_classes": true
+    }
+  ]
+}

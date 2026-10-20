@@ -103,13 +103,19 @@ fi
 #       没有 export default」会退回 service-worker 格式（认 self.onfetch，不认顶层
 #       fetch 导出）→ 请求进来 0ms 空返回（CF 日志 outcome:ok 但 wallTimeMs:0）。
 #       CF modules 格式要求 `export default { fetch }`。
-#   (3) **`import * as wasm from "./index_bg.wasm"` + `__wbg_set_wasm(wasm)`**：
-#       把 wrangler 内联的 wasm 注入 index_bg.js 的模块级 `wasm` 变量（等价 index.js
-#       做的初始化），让 `fetch` 调用时 `wasm` 不是 undefined。
+#   (3) **`import * as wasm from "./index_bg.wasm"` + `__wbg_set_wasm(wasm)` +
+#       `wasm.__wbindgen_start()`**：把 wrangler 内联的 wasm 注入 index_bg.js 的模块级
+#       `wasm` 变量，并**必须**调 `__wbindgen_start()` 初始化 wasm 实例（跑 wasm 的
+#       start 函数、激活导出）。漏了 `__wbindgen_start()` 则 wasm 的 `fetch` 导出还没
+#       激活 → CF 报 `wasm.fetch is not a function`（index_bg.js:491）。
+#       这套 `import * as wasm` + set_wasm + __wbindgen_start 与 wasm-bindgen bundler
+#       target 产出的 index.js 完全一致（worker-build 官方工作版本同款），只是这里
+#       不 re-export（绕开 index.js 的 0.2.128 re-export bug），改用 export default。
 cat > "$OUTPUT/worker.js" <<'JS'
 import * as wasm from "./index_bg.wasm";
 import { __wbg_set_wasm, fetch } from "./index_bg.js";
 __wbg_set_wasm(wasm);
+wasm.__wbindgen_start();
 export default { fetch };
 JS
 

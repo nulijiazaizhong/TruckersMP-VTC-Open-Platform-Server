@@ -244,19 +244,82 @@ async fn fetch_inner(mut req: Request, env: Env, _ctx: Context) -> Result<Respon
             };
         }
         ("/auth/login", Method::Post) => {
-            // ★ 分段探针 v2：已确认共享前置 OK、崩溃在 login 处理。
-            // 本次只做到「解析 body + D1 读用户」，回显用户是否存在 + 任何 D1 错误；
-            // 不碰密码哈希 / JWT / 写库。据此区分：崩在 D1 读，还是崩在后续步骤。
+            // ★ 分段探针 v3：手动重放 auth_service.login 的步骤，每步带 stage 标记 +
+            // 错误捕获，一次部署即可看到「卡在哪一步」。不返回 token（安全）。
+            // 已确认：body 解析 OK、D1 读用户 OK（admin/Active）。本次覆盖 密码→JWT→写库→组DTO。
             let body: dto::auth::AuthLoginDto = req.json().await.unwrap_or_default();
-            return match db.get_user_by_username(&body.username).await {
-                Ok(Some(u)) => ok_json(&serde_json::json!({
-                    "stage":"db-user-found","username":u.username,"id":u.id,"status":u.status,
-                })),
-                Ok(None) => ok_json(&serde_json::json!({
-                    "stage":"db-user-none","query":body.username,
-                })),
-                Err(e) => err_json(&e),
+            let stage_err = |stage: &str, e: &AppError| {
+                serde_json::json!({"stage": stage, "ok": false, "err": e.to_string(), "status": e.status()})
             };
+            // 1) 限流（rate）
+            if let Err(e) = rate
+                .hit("127.0.0.1", &body.username, 5, std::time::Duration::from_secs(60))
+            {
+                return ok_json(&stage_err("rate-limited", &e));
+            }
+            // 2) D1 读用户
+            let user = match db.get_user_by_username(&body.username).await {
+                Ok(Some(u)) => u,
+                Ok(None) => return ok_json(&serde_json::json!({"stage":"db-user-none","query":body.username})),
+                Err(e) => return err_json(&e),
+            };
+            // 3) 状态
+            if user.status != vtc_core::constants::status::ACTIVE {
+                return ok_json(&serde_json::json!({"stage":"status-disabled","status":user.status}));
+            }
+            // 4) 密码校验（大循环 PBKDF2，CPU 重）
+            match vtc_core::auth::password::verify_password(&body.password, &user.pass_hash) {
+                Ok(true) => {}
+                Ok(false) => return ok_json(&serde_json::json!({"stage":"bad-password","ok":false})),
+                Err(e) => return ok_json(&stage_err("verify-password-err", &e)),
+            }
+            // 5) JWT 签发
+            let access = match jwt.issue_access(&user.id, &user.username, &user.role, &user.status) {
+                Ok(a) => a,
+                Err(e) => return ok_json(&stage_err("jwt-access", &e)),
+            };
+            let refresh = match jwt.issue_refresh(&user.id, &user.username) {
+                Ok(r) => r,
+                Err(e) => return ok_json(&stage_err("jwt-refresh", &e)),
+            };
+            // 6) D1 写：吊销旧 refresh
+            if let Err(e) = db.revoke_all_for_user(&user.id).await {
+                return err_json(&e);
+            }
+            // 7) D1 写：插入新 refresh（探针只需验证 D1 写成功，thash 用占位长度串）
+            {
+                let rt = vtc_core::domain::RefreshToken {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    token_hash: "probe-".repeat(16),
+                    user_id: user.id.clone(),
+                    expires_at: chrono::Utc::now()
+                        + chrono::Duration::days(vtc_core::constants::jwt::REFRESH_TTL_DAYS),
+                    revoked_at: None,
+                    replaced_by: None,
+                    created_at: chrono::Utc::now(),
+                };
+                if let Err(e) = db.insert_refresh_token(&rt).await {
+                    return err_json(&e);
+                }
+            }
+            // 8) D1 写：last_login
+            if let Err(e) = db.update_user_last_login(&user.id, chrono::Utc::now()).await {
+                return err_json(&e);
+            }
+            // 9) D1 读：member
+            let member = match db.get_member_by_user(&user.id).await {
+                Ok(m) => m,
+                Err(e) => return err_json(&e),
+            };
+            // 10) 组 DTO（不返回 token 本体，只报成功 + 长度）
+            let _ = access;
+            let _ = refresh;
+            let _ = member;
+            return ok_json(&serde_json::json!({
+                "stage":"all-done","ok":true,
+                "username":user.username,"role":user.role,
+                "access_len":access.len(),"refresh_len":refresh.len(),
+            }));
         }
         ("/auth/refresh", Method::Post) => {
             let body: dto::auth::AuthRefreshDto = req

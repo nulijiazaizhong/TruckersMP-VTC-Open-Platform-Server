@@ -176,12 +176,19 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response, Er
         Ok(s) => s.to_string(),
         Err(_) => String::new(),
     };
-    // ★ 捕获 ensure_ready 的**具体**错误并返回（不再 .is_err() 吞掉）：
-    //   首次访问建表/seed 失败时（D1 不存在 / SQL 错 / 权限），把真实错误带进 response，
-    //   便于线上诊断（否则只回固定「D1 初始化失败」，看不到 D1 到底报什么）。
+    // ★ 捕获 ensure_ready 的**真实**错误并返回：
+    //   ensure_ready 内部（db.rs）把 D1 错误包成 AppError::Internal(真实anyhow)，但
+    //   AppError 的 Display（thiserror #[error]）对 Internal 是固定「服务器内部错误」，
+    //   直接 format! {e} 会丢掉真实 D1 错误。这里**匹配** AppError::Internal 提取内层
+    //   anyhow（真实 D1 错误：database not found / SQL 错 / 权限等），带进 response，
+    //   便于线上诊断（否则只回固定「服务器内部错误」，看不到 D1 到底报什么）。
     if let Err(e) = ensure_ready(&db, &pwd).await {
+        let inner = match &e {
+            AppError::Internal(inner) => inner.to_string(),
+            other => other.to_string(),
+        };
         return err_json(&AppError::Internal(anyhow::anyhow!(
-            "D1 初始化失败（建表/种子）：{e}；请确认 `DB` 绑定指向可用 D1"
+            "D1 初始化失败（建表/种子）：{inner}；请确认 `DB` 绑定指向可用 D1"
         )));
     }
     let (jwt, rate) = worker_services(&cfg);

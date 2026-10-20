@@ -248,10 +248,10 @@ async fn fetch_inner(mut req: Request, env: Env, _ctx: Context) -> Result<Respon
             // ★ **不**用 console_log 做诊断：CF worker 的 console（web_sys::console）在
             // wasm 单线程热路径**连续**同步调用会**挂起**（CF 判定 hang 取消请求，
             // "Worker's code had hung"）——前两条侥幸过、第三条卡死。诊断改走 response。
-            let body: dto::auth::AuthLoginDto = match req.text().await {
-                Ok(t) => serde_json::from_str(&t).unwrap_or_default(),
-                Err(_) => dto::auth::AuthLoginDto::default(),
-            };
+            // ★ 用 worker-rs 原生 req.json 解析 body：req.text 在 wasm 边界对 POST body
+            // 的读取可能抛异常（→ __wbg_new / hang），req.json 是 worker-rs 内部稳定的 body 路径。
+            // 解析失败回 default（空 username → 400 用户名或密码错误，而非 500 崩溃）。
+            let body: dto::auth::AuthLoginDto = req.json().await.unwrap_or_default();
             let auth = AuthService::new(
                 db.clone(),
                 jwt.clone(),
@@ -265,12 +265,10 @@ async fn fetch_inner(mut req: Request, env: Env, _ctx: Context) -> Result<Respon
             };
         }
         ("/auth/refresh", Method::Post) => {
-            let body: dto::auth::AuthRefreshDto = match req.text().await {
-                Ok(t) => serde_json::from_str(&t).unwrap_or(dto::auth::AuthRefreshDto {
-                    refresh_token: String::new(),
-                }),
-                Err(_) => dto::auth::AuthRefreshDto { refresh_token: String::new() },
-            };
+            let body: dto::auth::AuthRefreshDto = req
+                .json::<dto::auth::AuthRefreshDto>()
+                .await
+                .unwrap_or(dto::auth::AuthRefreshDto { refresh_token: String::new() });
             let auth = AuthService::new(db, jwt, rate, cfg.require_tmp, cfg.require_steam);
             return match auth.refresh(&body.refresh_token, "127.0.0.1").await {
                 Ok(v) => ok_json(&v),

@@ -746,7 +746,10 @@ async fn seed_admin(db: &Arc<db::D1Db>, pwd: &str) -> vtc_core::error::AppResult
             last_login: None,
             created_at: chrono::Utc::now(),
         };
-        db.insert_user(&admin).await?;
+        // ★ upsert（不是 insert_user）：抗并发/重入的 UNIQUE 冲突。CF stateless 冷启动
+        // 窗口内多请求并发 ensure_ready 都判 admin 不存在→都 INSERT→第二个撞 user.username
+        // UNIQUE。upsert 让「已存在则更新密码，不存在则插入」，永不冲突。
+        db.upsert_admin_user(&admin).await?;
         db.insert_member(&Member {
             id: uuid::Uuid::new_v4().to_string(),
             user_id: admin.id.clone(),

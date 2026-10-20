@@ -62,6 +62,27 @@ impl D1Db {
     pub fn new(d1: D1Database) -> Self {
         D1Db(Arc::new(d1))
     }
+
+    /// ★ seed 专用：admin 用户 upsert（`ON CONFLICT(username) DO UPDATE`）。
+    /// 抗并发/重入：CF stateless 下冷启动窗口内多个请求并发跑 ensure_ready，
+    /// 都判 admin 不存在→都 INSERT→第二个撞 user.username UNIQUE（check-then-act race）。
+    /// upsert 让「已存在则更新密码/角色，不存在则插入」，永不 UNIQUE 冲突。
+    /// **不改** `insert_user`（member 注册等场景需保留「用户名已存在→报 Conflict」语义）。
+    /// 固有方法（**非** Db trait），seed_admin（lib.rs）直接 `db.upsert_admin_user(..)` 调。
+    pub async fn upsert_admin_user(&self, u: &vtc_core::domain::User) -> AppResult<()> {
+        exec(self,
+            "INSERT INTO \"user\" (id,username,pass_hash,role,status,tmp_player_id,steam_id,last_login,created_at)
+             VALUES (?,?,?,?,?,?,?,?,?)
+             ON CONFLICT(username) DO UPDATE SET
+               pass_hash=excluded.pass_hash, role=excluded.role, status=excluded.status",
+            vec![
+                Arg::Text(u.id.clone()), Arg::Text(u.username.clone()), Arg::Text(u.pass_hash.clone()),
+                Arg::Text(u.role.clone()), Arg::Text(u.status.clone()),
+                u.tmp_player_id.clone().into_arg(), u.steam_id.clone().into_arg(),
+                u.last_login.as_ref().map(dt_to_str).into_arg(),
+                Arg::Text(dt_to_str(&u.created_at)),
+            ]).await
+    }
 }
 
 impl Deref for D1Db {

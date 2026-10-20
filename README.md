@@ -24,8 +24,9 @@ vtc-rs/
 │  └─ vtc-worker/              # Cloudflare 形态
 │       └─ D1Db(worker::d1) + R2Storage + worker.rs 路由入口
 │       └─ wrangler.jsonc（CI/CD 可选）+ migrations/（手动改 schema 参考）
-├─ map-dlc/                    # 复用上层模板
-├─ docker/                     # Dockerfile + docker-compose
+├─ map-dlc/                    # 地图 DLC 版本清单（随仓库自包含，部署不依赖上层）
+├─ Dockerfile                  # Docker 多阶段构建（musl 静态 + bundled sqlite）
+├─ docker-compose.yml          # docker compose 编排
 └─ .env.example
 ```
 
@@ -37,26 +38,38 @@ SQLite/本地/内存，CF 注入 D1/R2，业务逻辑零重写。
 
 ### Docker 形态（自部署）
 
+**推荐：直接 `docker compose`**（在项目根目录，Dockerfile / compose / map-dlc 都在仓库内，自包含）：
 ```bash
-# 前置：rustup + 预编译 sqlite（沙箱下 MSVC cl 无法被 cc-rus 调用）
-# 本机 Windows：
-$env:SQLITE3_LIB_DIR = "<repo>/prebuilt"   # 指向 sqlite3.lib
-$env:SQLITE3_STATIC = "1"
-cargo build -p vtc-server
-
-# 容器：
-docker compose -f docker/docker-compose.yml up -d
+# 在项目根目录（仓库根）：
+$env:JWT_SECRET = "换一长串随机串"        # PowerShell；Linux/macOS 用 export JWT_SECRET=...
+docker compose up -d
+curl http://127.0.0.1:8731/api/v1/health   # 返回 {"code":0} 即启动成功
 ```
+> Docker 构建在容器内用 **bundled sqlite**（自带 C 源码现场编译，musl 静态链接），
+> **不需要**本机预编译 sqlite，也不需要 `prebuilt/`。`.env` 里的 `JWT_SECRET` 等会自动注入。
+
+<details>
+<summary>不用 Docker、本机直接编译二进制（可选）</summary>
+
+```bash
+# 本机需 rust 工具链 + 一个 C 编译器（bundled sqlite 要 cc 编译 SQLite C 源码）
+# Windows：用 MSVC 或 clang；musl 静态目标需 musl-gcc（见 Dockerfile）
+cargo build -p vtc-server --release
+# 产物：target/release/vtc-server（Linux musl 静态 / 本机 gnu 动态）
+```
+</details>
 
 ### Cloudflare Workers 形态
 
-只需 `cargo build` 出一个 `.wasm`，把它拖进 Cloudflare 控制台即可（**不装 wrangler / 不建 CLI**）。
-完整网页端步骤见下方 **[Cloudflare Workers 部署](#cloudflare-workers-部署)**。
+**推荐部署方式：在 Cloudflare 控制台「连接 GitHub 仓库」，之后 push `main` 自动构建 + 部署**，
+全程网页点选，**不用装 wrangler / Rust / Node**（Rust 工具链由 Cloudflare 构建时自动装）。
+最短路径见下方 **[Cloudflare Workers 部署（连 GitHub 仓库）](#cloudflare-workers-部署)**。
 
-```bash
-cargo build -p vtc-worker --target wasm32-wasip2 --release
-# 产物：target/wasm32-wasip2/release/vtc_worker.wasm（release 约 22 MB）
-```
+> 本地构建（仅调试 / 手动上传时用）：
+> ```bash
+> cargo build -p vtc-worker --target wasm32-wasip2 --release
+> # 产物：target/wasm32-wasip2/release/vtc_worker.wasm（release 约 59 KB，已开 lto/strip）
+> ```
 
 ## 与 .NET 版的契约对齐
 
@@ -84,133 +97,124 @@ service 代码两种 feature 下**完全相同**——这是"一份代码双编�
 
 - **推送**：Docker 用内存存根、CF 用 Durable Objects 骨架，**WebSocket 真实推送在 P1**。
 - **S3/PostgreSQL**：Docker 默认 SQLite + 本地存储；S3/PG 是 P1（接口已留）。
-- **C 依赖规避**：手写 JWT/PBKDF2（不拉 jsonwebtoken/pbkdf2 → 避免 ring C 编译）；
-  SQLite 用预编译库（不 bundled）。这是为适应无 C 编译器环境的工程取舍，生产可换回 bundled。
+- **C 依赖**：手写 JWT/PBKDF2（不拉 jsonwebtoken/pbkdf2 → 避免 ring C 编译）；
+  SQLite 用 **bundled**（自带 C 源码现场编译）。Docker 里 musl 静态链接必须 bundled——
+  系统 `libsqlite3.a` 混入 glibc 启动对象会导致运行时 SIGSEGV（139），bundled 从根上避开；
+  且 bundled 让 Windows 本机构建也不再需要预编译 `prebuilt/sqlite3.lib`。CF Worker 形态零 C（用 D1）。
 
 ## Cloudflare Workers 部署
 
-> **服务端只有两套部署方案**：**① Docker 自部署**（[docker compose](#构建)，下面略）；
-> **② Cloudflare Workers**（本节）。方案 ② 有两种触发方式：
-> - **②-A 手动上传**（下文 ①–⑦）：本地 `cargo build` 出 `.wasm`，拖进 Dashboard。**最快上手**，适合一次性部署。
-> - **②-B 从 Git 仓库自动部署**（[见文末「从 Git 仓库部署」](#从-git-仓库部署-cloudflare-builds--github-actions)）：
->   连 GitHub 仓库，push 即构建部署。**适合持续迭代 / CI/CD**。
+> **服务端两套部署**：**① Docker 自部署**（[docker compose](#构建)）；**② Cloudflare Workers**（本节）。
+> 本节只讲**一条推荐路径**：在 Cloudflare 控制台**「连接 GitHub 仓库」**，之后 push `main` 自动构建 + 部署。
+> 全程网页点选，**不用在本机装 wrangler / Rust / Node**——Rust 工具链由 Cloudflare 在构建时自动安装。
 >
-> 两者产出同一个 worker（同一个 `vtc_worker.wasm` + `index.js`），只是「在哪构建」不同。
+> 想要「不连仓库、手动拖 wasm」的一次性部署？见本节末尾 [附：手动上传 wasm](#附手动上传-wasm不连仓库)。
 
-worker 形态**零 C 依赖**（D1/R2 走 CF 托管，无 SQLite、无本地存储），`cargo build` 直接出 wasm，
-不需要 Docker 形态那套预编译 SQLite。**一条代码、一套服务逻辑**，与 Docker 完全共享。
+worker 形态**零 C 依赖**（D1/R2 走 CF 托管，无 SQLite、无本地存储）。**一份代码、一套服务逻辑**，
+与 Docker 形态完全共享 `vtc-core`。
 
-**核心简化——首次访问自愈**：worker 在**每个请求前**自检「D1 建表没有 / admin 有没有」，缺了自动补
-（`src/lib.rs` 的 `ensure_ready`：跑幂等 `db::migrate` 建 13 张表 + seed admin 与默认车队）。
-所以**不手动粘贴 SQL、不配 scheduled cron、不手动建表**：建好 D1/R2、绑名、上传 wasm，
-**第一次访问即自动把库建好并种进 admin**（冷启动约 +0.5s，幂等只跑一次）。
-
-**唯一要本地做的**：`cargo build` 出一个 `.wasm`，拖进控制台。
+**首次访问自愈（省心关键）**：worker 在每个请求前自检「D1 建表没有 / admin 有没有」，缺了自动补
+（`src/lib.rs` 的 `ensure_ready`：幂等 `db::migrate` 建 13 张表 + seed admin 与默认车队）。
+所以**不手动粘贴 SQL、不配 cron、不手动建表**——建好 D1/R2、连上仓库、部署，
+**第一次访问即自动建库并种进 admin**（冷启动约 +0.5s，幂等只跑一次）。
 
 ---
 
-### 网页端 Dashboard 部署（方案 ②）
+### 部署主路径：连接 GitHub 仓库（push 即部署）
 
-> 全程在 <https://dash.cloudflare.com> 操作，**不用装 wrangler / Node / Rust 以外的工具**。
+#### 第 1 步 · 先建好 D1 数据库 + R2 桶（网页端，各 1 分钟）
 
-**前提**：已 `cargo build -p vtc-worker --target wasm32-wasip2 --release`，得到
-`target/wasm32-wasip2/release/vtc_worker.wasm`（约 22 MB），下面要上传。
+部署 worker 前，先在 Cloudflare 建好它要用的两个资源（**只建空库/空桶，不跑任何 SQL**）：
 
-#### ① 建 D1 数据库（网页端，**只建空库，不跑 SQL**）
+1. **建 D1**：控制台左侧 **Workers & Pages → D1 数据库** → **Create a database** → 选区域、起名（如 `vtc`）。
+   记住库名 `vtc`（第 3 步绑定 D1 时选它）。
+2. **建 R2**：控制台 **Workers & Pages → R2 对象存储** → **Create a bucket** → 命名（如 `vtc-saves`）、选区域。
+   记住桶名 `vtc-saves`（第 3 步绑定 R2 时选它）。
 
-1. 控制台左侧 **Workers & Pages → D1 数据库**（或顶部搜「D1」）。
-2. 点 **Create a database**（创建数据库），选区域，起个名字（如 `vtc`）。
-3. 记住这个 D1 库的**名字**（`vtc`）——后面「配置 Worker」绑定 D1 时选它。
-   > **不需要**进 SQL 编辑器跑建表语句：worker 首次访问会自动建全部 13 张表（见「首次访问自愈」）。
-   > 若你之后要手动改 schema，再进 **SQL** 页追加 `CREATE / ALTER`（都带 `IF NOT EXISTS`，幂等）。
+> 不需要进 SQL 编辑器建表——worker 首次访问会自动建全部 13 张表（见上「首次访问自愈」）。
 
-#### ② 建 R2 存储桶（网页端）
+#### 第 2 步 · 连接 GitHub 仓库（创建 worker 的入口）
 
-1. 控制台左侧 **Workers & Pages → R2 对象存储**（或搜「R2」）。
-2. 点 **Create a bucket**，命名（如 `vtc-saves`），选区域。
-3. 记下桶名（`vtc-saves`）——后面「配置 Worker」绑定 R2 时选它。
-4. （可暂缓）存档与 DLC 模板都放这个桶；先建空桶也行，DLC 模板稍后从「④ 配路由」前的 ③ 步补传。
+1. 控制台 **Workers & Pages → 创建 Worker（Create a Worker）**。
+2. **选「连接 GitHub 仓库 / Connect Git repository」**（不是「创建 Worker」模板、不是「上传代码」）。
+3. 首次会要求**授权 Cloudflare 的 GitHub 应用**（点 `Configure Cloudflare` → 允许访问）。
+4. 选仓库 **`nulijiazaizhong/TruckersMP-VTC-Open-Platform-Server`**、分支 **`main`**。
+5. 进入「**设置应用程序**」页，**按下表逐项填**（CF 默认值按 Node 项目预设，对 Rust 仓库全部要改）：
 
-#### ③ 创建 Worker 并上传 wasm + index.js（网页端，**两个文件都要传**）
+| 表单字段 | 填什么 | 说明 |
+|---|---|---|
+| **项目名称** | `vtc-server` | CF 默认填仓库 slug，建议改成和 worker 名一致（非必须）。 |
+| **构建命令** | 见下方「构建命令」整段 | CF 镜像无 Rust，**必须**现场装 rustup + wasm target，再跑仓库脚本。 |
+| **部署命令** | 见下方「部署命令」整段 | 装 wrangler、把配置拷进产物目录再 `wrangler deploy`。 |
+| **预览命令** | **留空** | worker-rs 本地预览易报错，不需要。 |
+| **启用预览构建** | **关** | 同上。 |
+| **使用 Cloudflare Access 保护** | **关** | API 服务不用，需要时再开。 |
+| **高级设置** | 默认即可 | 展开可设 Rust 版本等，不填也行。 |
 
-1. 控制台左侧 **Workers & Pages → 创建 Worker**（Create Worker）。
-2. **选「上传代码 / Upload code」**（不是「粘贴 JS / Create Worker」模板）。
-3. **同时上传两个文件**（这一步最容易出错，缺一不可）：
-   - `vtc_worker.wasm`（上面构建出的 wasm）
-   - `index.js`（仓库 [`crates/vtc-worker/index.js`](crates/vtc-worker/index.js)，**必须和 wasm 一起传**）
-   > **为什么必须有 `index.js`**：CF 区分「代码 Worker」（JS + 二进制）与「静态 Worker」。
-   > worker-rs 编出来是**纯 wasm**，若只传 `.wasm` 不传 JS，CF 会把它当成**静态 Worker**
-   > ——到「添加绑定」时就会报 **「不能将绑定添加到只有静态资产的 Worker」**（这正是你遇到的提示）。
-   > `index.js` 就两行（加载 wasm + `export { fetch }`），让 CF 认出这是**代码 Worker**，绑定就解锁了。
-4. 命名（如 `vtc-server`），点 **Deploy**。此时 worker 已上线，先得到
-   `https://vtc-server.<你的子域>.workers.dev`。
+**构建命令**（整段粘贴）——装 Rust + wasm target，再跑仓库自带脚本（脚本会 build 并把
+`vtc_worker.wasm` + `index.js` 拷进 `dist/`；**两个文件必须都在**，否则 CF 当成「静态 Worker」绑不上 D1/R2）：
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
+  && source "$HOME/.cargo/env" \
+  && rustup target add wasm32-wasip2 \
+  && bash crates/vtc-worker/cf-build.sh
+```
 
-> ⚠ 若你**已经**只传了 wasm、看到了「只有静态资产」的提示：
-> 进入该 Worker → **Settings → 代码 / 部署**，重新「上传代码」，把 `index.js` 和 `vtc_worker.wasm`
-> **两个一起**再传一次覆盖（或用控制台顶部的「上传新的 Wasm + 编辑 JS」），绑定入口即恢复。
+**部署命令**（整段粘贴）——装 wrangler、把 `wrangler.jsonc` 拷进产物目录、在产物目录里部署
+（`wrangler.jsonc` 的 `main: index.js` 会让 wrangler 把 `index.js` + `vtc_worker.wasm` 一起上传 = 「代码 Worker」）：
+```bash
+npm i -g wrangler@3 \
+  && cp crates/vtc-worker/wrangler.jsonc crates/vtc-worker/dist/ \
+  && cd crates/vtc-worker/dist \
+  && wrangler deploy
+```
 
-#### ④ 配置 Worker（网页端 Settings）
+6. 点右下 **部署**。CF 开始首次构建（装 Rust 约 1–2 分钟 + build + deploy），完成后 worker 上线，
+   得到 `https://vtc-server.<你的子域>.workers.dev`。**之后每次 push `main` 自动重构建 + 重部署。**
 
-进入刚建的 worker → **Settings**（设置）页，分四个子页配：
+> ⚠ **占位符**：`wrangler.jsonc` 里有 `<D1_DATABASE_ID>` / `<ZONE_ID>` 两个占位符。
+> **最简单**：第 3 步在 Dashboard 把 `DB`/`BUCKET` 绑定配好后，把上面「部署命令」最后的
+> `wrangler deploy` 改成 **`wrangler deploy --remote-config`**——wrangler 会从 Cloudflare 拉回该
+> worker 已保存的绑定/变量/密钥覆盖本地配置，占位符免填、不报错。（这是推荐做法。）
+> 或者把占位符填实（D1 的 Database ID、域名的 Zone ID），但容易填错，不如 `--remote-config`。
 
-1. **Observability → Logs**：按需开（可选，便于排查）。
-2. **Settings → Bindings**（资源绑定）：
-   - **Add D1 database** → 绑定名填 **`DB`**，选 ① 建的 D1 库（`vtc`）。
-   - **Add R2 bucket** → 绑定名填 **`BUCKET`**，选 ② 建的 R2 桶（`vtc-saves`）。
-   > ⚠ 绑定名必须**精确**是 `DB` 和 `BUCKET`（全大写），代码 `src/lib.rs` 里按这两个名字取
-   > `env.d1("DB")` / `env.get_binding("BUCKET")`，名字对不上会运行时报「binding 未找到」。
-3. **Settings → Variables and Secrets**（环境变量与密钥）：
-   - **Variables**（非机密）：
-     `TEAM_NAME`=默认车队、`UPDATE_CHANNEL`=stable、`PUBLIC_BASE`=你的正式域名
-     （如 `https://vtc.example.com`）、`AUTH_REQUIRE_TMP`=false、`AUTH_REQUIRE_STEAM`=false。
-   - **Secrets**（机密，网页端用 **Add secret** 而不是写进 variables）：
-     `JWT_SECRET`（**生产必须 ≥32 字符**）、`VTC_STORAGE_SIGN_KEY`（存储中转 HMAC 密钥）、
-     `VTC_ADMIN_PASSWORD`（seed 出的 admin 初始密码，**强烈建议设一个随机强口令**；
-     不设则用内置默认 `ChangeMe123!`）。
-   > 网页端没有 `wrangler secret put`，对应用 **Variables and Secrets → Add secret** 弹窗填值。
-4. **Settings → Compatibility**（兼容性）：
-   - **Compatibility Date** 选 **`2025-08-01`**（与 `wrangler.jsonc` 一致）。
-   - **Compatibility Flags**：**必须勾选 `nodejs_compat`**（Enable Node.js compatibility）。
-     > 这是 worker-rs 上传 wasm 的**硬性要求**：wasm 内的 `wasm-bindgen` 胶水依赖 Node.js
-     > 兼容层才能跑。不勾这个 flag，worker 会启动即报错。
+#### 第 3 步 · 配绑定、密钥、兼容 flag（网页端 Settings，一次性）
 
-#### ⑤ 配路由 / 域名（网页端 Routing）
+构建部署后，进该 worker → **Settings**，配四样（**只需配一次**，之后每次 push 自动复用）：
 
-还是这个 worker 的 **Settings → Routing**（或「Rules / 域名」页）：
+1. **Bindings**（资源绑定）——名字必须**精确**全大写：
+   - **Add D1 database** → 绑定名 **`DB`** → 选第 1 步建的 `vtc`。
+   - **Add R2 bucket** → 绑定名 **`BUCKET`** → 选第 1 步建的 `vtc-saves`。
+   > 代码按 `env.d1("DB")` / `env.get_binding("BUCKET")` 取，名字对不上运行时报「binding 未找到」。
+2. **Variables and Secrets**：
+   - **Variables**（非机密）：`TEAM_NAME`=默认车队、`UPDATE_CHANNEL`=stable、
+     `PUBLIC_BASE`=你的正式域名（如 `https://vtc.example.com`）、`AUTH_REQUIRE_TMP`=false、`AUTH_REQUIRE_STEAM`=false。
+   - **Secrets**（机密，用 **Add secret** 弹窗填）：
+     `JWT_SECRET`（生产 ≥32 字符）、`VTC_STORAGE_SIGN_KEY`（存储中转 HMAC）、
+     `VTC_ADMIN_PASSWORD`（admin 初始密码，**建议设随机强口令**；不设用内置 `ChangeMe123!`）。
+3. **Compatibility**：
+   - **Compatibility Date** 选 `2025-08-01`。
+   - **Compatibility Flags**：**必须勾 `nodejs_compat`**（worker-rs 上传 wasm 的硬性要求，不勾启动即报错）。
 
-1. **Workers Subdomain**（`*.workers.dev`）：默认开，用于联调（`vtc-server.<子域>.workers.dev`）。
-2. **Custom Domains / Routes**（正式域名）：把你的域（如 `vtc.example.com`）指过来，
-   加两条路由 `/api/*` 与 `/storage/*`（worker 同时服务这两类路径，见 `src/lib.rs`）。
-   > 若整站都走 worker（含根路径），可把路由设成 `vtc.example.com/*`。
+#### 第 4 步 · 验证（触发首次访问自愈）
 
-#### ⑥ 上传 DLC 模板到 R2（网页端，**可选，不影响核心 API**）
+- 打开 `https://vtc-server.<子域>.workers.dev/api/v1/health` 应返回 `ok`——**这一下就自动建了 13 张表 + 种 admin**。
+- `/api/v1/config/public` 返回车队品牌（无鉴权，此时 team 已 seed）。
+- 完整冒烟（登录 / 成员 / 存档 / DLC / 审计）见下方 [验证（部署后）](#验证部署后)。
 
-worker 无文件系统，DLC 地图模板存 **R2 的 `dlc-templates/` 前缀**
-（`/dlc/map-template` 与 `/dlc/disable` 从这里读）。**不传也能部署**，只是这两个 DLC 端点返回「模板缺失」：
+> **可选**：给 DLC 端点传地图模板到 R2 的 `dlc-templates/` 前缀（`dlc-templates/1.61.ets2.txt` 等，
+> 内容取自仓库 `map-dlc/`）。**不传也能部署**，只是 `/dlc/map-template` 返回「模板缺失」，不影响其它 API。
+> **admin 登录**：账号 `admin`，密码 = `VTC_ADMIN_PASSWORD`（没配则 `ChangeMe123!`），登录后建议立即改密，
+> 或用 `POST /api/v1/seed`（body `{"password":"新口令"}`，需 admin Bearer）重置。
 
-1. 控制台进入 ② 建的 R2 桶 → **文件 / Files**。
-2. **上传**两个文件，确保 R2 里的最终 key 是：
-   - `dlc-templates/1.61.ets2.txt`（内容来自上层 `map-dlc/1.61.ets2.txt`，10 条）
-   - `dlc-templates/1.61.ats.txt`（内容来自上层 `map-dlc/1.61.ats.txt`，20 条）
-   > R2 网页上传会把本地文件名映射成对象 key；把本地文件先**重命名**成
-   > `dlc-templates_1.61.ets2.txt` 再上传，或上传后在 R2 里移动到 `dlc-templates/` 前缀下，
-   > 确保最终 key 是 `dlc-templates/1.61.ets2.txt`（worker 按这个 key 读）。
-3. 加新游戏版本：把对应 `map-dlc/<major>.<game>.txt` 按同样 key 传到 `dlc-templates/`，
-   无需改 worker 代码。
+### 附：手动上传 wasm（不连仓库）
 
-#### ⑦ 验证（网页端，**触发首次访问自愈**）
-
-- 打开 `https://vtc-server.<子域>.workers.dev/api/v1/health` 应返回 `ok`。
-  **就是这一下**触发了 `ensure_ready`：自动建 13 张表 + 种入 admin / 默认车队（第一次约慢 0.5s）。
-- `/api/v1/config/public` 返回车队品牌（无鉴权，此时 team 已被 seed）。
-- 控制台左侧 **Workers → vtc-server → Logs** 可看实时请求日志；
-  **Workers → Observability** 看 CPU/内存曲线。
-- 完整冒烟（登录 / 成员 CRUD / 存档 / DLC / 审计）见下方 [验证](#验证部署后)。
-
-> **admin 登录**：seed 的账号是 `admin`，密码 = 你配的 `VTC_ADMIN_PASSWORD` secret；
-> 没配就是内置默认 `ChangeMe123!`。**登录后建议立即改密**，或用管理员自助端点
-> `POST /api/v1/seed`（body `{"password":"新密码"}`，需 admin Bearer）随时重置。
-> `JWT_SECRET` 忘配也能登录（worker 用内置开发默认值并打警告），但**生产必须配**。
+> 一次性部署、不想连 GitHub 仓库时用。本地 `cargo build -p vtc-worker --target wasm32-wasip2 --release`
+> 出 `vtc_worker.wasm`，在控制台 **创建 Worker → 上传代码**，**`vtc_worker.wasm` 和 `index.js`
+> （仓库 [`crates/vtc-worker/index.js`](crates/vtc-worker/index.js)）两个一起传**，再按上面第 3 步配
+> 绑定 / 密钥 / `nodejs_compat`。
+> ⚠ 只传 `.wasm` 不传 `index.js` 会被 CF 当成「静态 Worker」，报「不能将绑定添加到只有静态资产的 Worker」，
+> 绑不上 D1/R2——`index.js` 让 CF 认出这是「代码 Worker」，绑定才解锁。
 
 ### 验证（部署后）
 
@@ -227,110 +231,6 @@ curl -X POST $B/api/v1/auth/login -H 'content-type: application/json' \
 curl -X POST $B/api/v1/seed -H "authorization: Bearer <TOKEN>" \
      -H 'content-type: application/json' -d '{"password":"新强口令"}'
 ```
-
-### 从 Git 仓库部署（推荐：GitHub Actions 全自动流水线）
-
-> 上面的 ①–⑦ 是「手动上传」（本地 build 出 wasm 拖进去）。如果你要**连 GitHub 仓库、push 即部署**，
-> 用这一节。**前置**：已建好 D1/R2（同 ①②）、已在 Cloudflare 配好对应 Worker 的绑定与 secret（同 ④）。
-> 仓库直连只替代「③ 上传 wasm」这一步——把「手动拖文件」换成「CI 自动 build 后部署」。
->
-> 本流程对照 [Cloudflare 官方 Rust 文档](https://developers.cloudflare.com/workers/languages/rust/)：
-> 官方部署 = `npx wrangler deploy`（wrangler 调 build 命令产出 wasm + JS 入口再上传），
-> 并靠 `[profile.release] lto/strip/codegen-units` 控制 wasm 体积（本仓库已配，见
-> `crates/vtc-worker/Cargo.toml`）。worker-rs 的 wasm 由 `wasm-bindgen` 导出 `fetch` 等事件，
-> 需一个 JS 入口加载它——本仓库用 `index.js` 手动复刻了官方 `worker-build` 的「生成 JS 入口」步
-> （wasip2 + `nodejs_compat` 的新式 worker 不再需要 `worker-build` 的 webpack 打包）。
-
-**为什么 CF 原生「连接 Git 仓库」对 Rust 不顺手**：Cloudflare Builds 的预置构建镜像是
-Node/Python/Java/静态，**没有 Rust 镜像**，要在 Build command 里现场装 rustup（脆弱）。
-因此**推荐 GitHub Actions**（`dtolnay/rust-toolchain` 是成熟的 rust 安装方式），
-仓库已内置现成流水线 [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)。
-
-#### 方式 1（推荐）· GitHub Actions 全自动（已入库，push 即部署）
-
-流水线逻辑（见 [`deploy.yml`](.github/workflows/deploy.yml)）：
-- **任意 PR / 推送 `crates/**`** → `build` job：`cargo build -p vtc-worker --target wasm32-wasip2 --release`
-  作**编译门**（编不过即红，挡在合并前）。
-- **push `main`** → `deploy` job：复用/重编 wasm → 把 `index.js` + `vtc_worker.wasm` +
-  `wrangler.jsonc` 组装进 `crates/vtc-worker/dist/` → 官方
-  [`cloudflare/wrangler-action`](https://github.com/cloudflare/wrangler-action) 跑 `wrangler deploy`
-  上传（`main=index.js`，wasm+JS 一起传 = 「代码 Worker」，D1/R2 绑定全部生效）。
-
-**启用只需两步**（流水线已在仓库里，无需再贴 YAML）：
-1. GitHub 仓库 **Settings → Secrets and variables → actions** 加两个 secret：
-   - `CLOUDFLARE_API_TOKEN`（CF API Token，需 **Workers:Edit** 权限）
-   - `CLOUDFLARE_ACCOUNT_ID`（CF Account ID）
-2. 处理 `wrangler.jsonc` 里两个占位符 `<D1_DATABASE_ID>` / `<ZONE_ID>`（二选一）：
-   - **方案 A · 填实占位符**：`<D1_DATABASE_ID>` ← D1 库的 Database ID（Dashboard → D1 →
-     选库 → **Settings** 可见，或 `npx wrangler d1 list`）；`<ZONE_ID>` ← 你的域名 zone id
-     （**仅用自定义域名路由才需要**，Dashboard → 域名 → Overview → **API ID**，或
-     `npx wrangler whoami --json`）。> 若暂只用 `workers.dev` 子域，建议先把 `routes` 数组删掉
-     > （`workers_dev: true` 已够联调），否则 deploy 会因「zone 无权限」报错。
-   - **方案 B · `--remote-config` 复用 Dashboard 配置（推荐，免填占位符）**：
-     **前提**是已在 Dashboard 对这个 Worker 配好 `DB`/`BUCKET` 绑定（见上文 ④）。
-     然后在 GitHub 仓库 **Settings → Variables** 加 `CF_USE_REMOTE_CONFIG = "true"`，
-     流水线 deploy 步就自动跑 `wrangler deploy --remote-config`——wrangler 从 Cloudflare
-     拉回该 worker 已保存的 bindings/vars/secrets **覆盖**本地 `wrangler.jsonc` 的
-     bindings/routes，占位符免填也不报错。
-     > 注意：`cloudflare/wrangler-action` **没有 `flags` 输入**，`--remote-config` 写在
-     > `command` 里（`deploy --remote-config`），本流水线已处理好。
-
-之后 push `main` 即自动构建 + 部署；开 PR 时自动跑编译门。
-
-#### 方式 2 · Cloudflare Builds（Dashboard 内「连接 Git 仓库」，备选）
-
-> 适合「不想用 GitHub Actions，直接在 Cloudflare 控制台连仓库」的场景。
-> 入口：**Dashboard → Workers & Pages → Create Worker → 选「Connect Git repository」**
-> （或已建好的 worker → Settings → Build → Connect Git repository）。
-> 授权 GitHub 应用后选仓库 `nulijiazaizhong/TruckersMP-VTC-Open-Platform-Server`、分支 `main`，
-> 进入「**设置应用程序**」页（= 下图表单）。**逐项按下面填**（CF 默认值是按 Node 项目预设的，
-> 对 Rust 仓库全部要改）：
-
-| 表单字段 | 填什么 | 说明 |
-|---|---|---|
-| **GitHub 仓库** | `nulijiazaizhong/TruckersMP-VTC-Open-Platform-Server` | 顶部已选的仓库（授权时选的） |
-| **项目名称** | `vtc-server`（**建议改**） | CF 默认会填仓库 slug（`truckersmp-vtc-open-platform-server`）；建议改成和 worker 名一致，避免混淆。非必须。 |
-| **构建命令**（Build command，可选） | 见下方「构建命令」整段 | CF 默认空 / 或 Node 的 `npm build`；**必须填**，因为 CF 镜像无 Rust |
-| **部署命令**（Deploy command） | 见下方「部署命令」整段 | CF 默认 `npx wrangler deploy`；**必须改**，要拷 wrangler 配置进产物目录 |
-| **预览命令**（Preview command） | **清空** | CF 默认 `npx wrangler preview`；worker-rs 本地预览易报错（nodejs_compat 模拟），**留空** |
-| **启用预览构建**（开关） | **关**（off） | 同上，不需要预览 |
-| **使用 Cloudflare Access 保护**（开关） | **关**（off） | 这是给 workers.dev 子域加 Cloudflare Access 门；API 服务一般不用。需要时再开 |
-| **高级设置**（折叠） | 按需 | 可设「构建环境」（如 Rust 版本）、缓存目录等；默认即可 |
-| **部署**（右下蓝按钮） | 点它触发首次构建 | 之后 `main` 分支每次 push 自动重构建 + 部署 |
-
-**构建命令**（整段粘贴到「构建命令」框）——先装 Rust 工具链 + wasm target，再跑仓库脚本：
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
-  && source "$HOME/.cargo/env" \
-  && rustup target add wasm32-wasip2 \
-  && bash crates/vtc-worker/cf-build.sh
-```
-（`cf-build.sh` 会 `cargo build -p vtc-worker --target wasm32-wasip2 --release`，并把
-`vtc_worker.wasm` + `index.js` 拷进 `crates/vtc-worker/dist/`——产物里**必须同时有 `index.js`**，
-否则又是「只有静态资产」、绑不上 D1/R2，见上文 ③。）
-
-**部署命令**（整段粘贴到「部署命令」框）——装 wrangler、把配置拷进产物目录、在产物目录里 deploy：
-```bash
-npm i -g wrangler@3 \
-  && cp crates/vtc-worker/wrangler.jsonc crates/vtc-worker/dist/ \
-  && cd crates/vtc-worker/dist \
-  && wrangler deploy
-```
-（`wrangler deploy` 读 `wrangler.jsonc` 的 `main: index.js`，把 `index.js` + `vtc_worker.wasm`
-一起上传 = 「代码 Worker」，D1/R2 绑定生效。占位符 `<D1_DATABASE_ID>`/`<ZONE_ID>` 的处理
-同方式 1：要么填实，要么把 `wrangler deploy` 改成 `wrangler deploy --remote-config`
-复用 Dashboard 已配资源。）
-
-> 构建完成后，worker 即上线。绑定（`DB`/`BUCKET`）、secret（`JWT_SECRET` 等）、`nodejs_compat`
-> 在 worker 的 **Settings → Bindings / Variables and Secrets / Compatibility** 里配一次即可，
-> 之后每次 push 自动重构建并复用这些配置。
-
-> **两种方式二选一**，**不要同时**给同一 worker 配（会互相覆盖部署）。
-> `wrangler.jsonc` 的 `<D1_DATABASE_ID>` / `<ZONE_ID>` 占位符：要么**填实**，要么在 deploy 命令里
-> 加 `--remote-config`（即 `wrangler deploy --remote-config`）复用 Dashboard 资源——注意它是
-> **deploy 的子命令参数**，不是 wrangler-action 的 `flags` 输入（action 无此字段）。
-> `JWT_SECRET` / `VTC_STORAGE_SIGN_KEY` / `VTC_ADMIN_PASSWORD` 三个 secret
-> 在 worker 的 Settings → Variables and Secrets 里配好（构建/部署不自动带）。
 
 ### 形态对照（同一份 service，两种后端）
 
@@ -350,8 +250,8 @@ npm i -g wrangler@3 \
 - **P0 全量 API**：Docker 形态编译绿 + 运行时全链路冒烟通过（health/config/public/login/members CRUD/
   saves 上传凭证+发布+下载凭证+取消+删除/announcements CRUD/events CRUD/dlc map-template+required+
   report+disable+restore/audit 列表+过滤/存储中转 PUT+GET/401 鉴权边界）。
-- **Cloudflare Workers 形态**：编译绿（`vtc_worker.wasm` 22 MB），P0 全量路由与 Docker 同源
-  （共享 vtc-core service）。部署走 **Cloudflare 网页端 Dashboard**（全程点选：拖入 .wasm +
+- **Cloudflare Workers 形态**：编译绿（`vtc_worker.wasm` 约 59 KB，已开 lto/strip），P0 全量路由与 Docker 同源
+  （共享 vtc-core service）。部署走 **Cloudflare 控制台「连接 GitHub 仓库」**（push main 自动构建部署，
   绑 D1/R2 + 勾 `nodejs_compat`），见上方 [Cloudflare Workers 部署](#cloudflare-workers-部署)。
   **首次访问自愈**：worker 第一次请求自动建 13 张表并 seed admin / 默认车队，免手动建表与 cron。
 - **遗留（P1）**：WebSocket 真实推送（Durable Objects）、S3/PostgreSQL 后端。

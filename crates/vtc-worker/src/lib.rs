@@ -244,18 +244,62 @@ async fn fetch_inner(mut req: Request, env: Env, _ctx: Context) -> Result<Respon
             };
         }
         ("/auth/login", Method::Post) => {
-            // ★ v7：rate 已根治（`Mutex`→`RefCell`；无 multi-thread 的 wasm 下
-            //   `Mutex::lock()` 走平台锁/线程启动 → worker 立即 abort，即 v6 的
-            //   1101）。跑**完整** `auth.login`（rate→db→status→PBKDF2→JWT→D1 写→
-            //   audit→member）。正常结果（200 带 token / 401 密码错 / 429 限流 / 403
-            //   禁用）都意味着**全链路在 wasm 上通了**，剩下的只是密码对不对；
-            //   若仍 1101 且无任何 JSON body = 该步有其它 wasm 不兼容点，再按 JWT/写细分。
+            // ★ v8 分段探针：**每个**分支都返回 plain `ok_json`（**不**走 `Err`/`to_js_value`），
+            //   这样「到达哪个 stage」直接暴露是哪一步在 wasm↔JS 边界触发异常（worker-rs 0.8.6
+            //   `Error::Internal(JsValue)`/`UnknownJsError{original:JsValue}` → `to_js_value` 把
+            //   原始 JS 错误对象 clone 回边界 → CF `__wbg_new` Critical，即 v7 的 1101）。
+            //   顺序：rate(RefCell) → db读 → status → **PBKDF2** → **JWT**。
+            //   - 停在 password-*：崩溃在 PBKDF2 之前（db/status）。
+            //   - 停在 jwt-ok：全链路通 → 恢复完整 auth.login，剩 D1 写 / 密码对不对。
             let body: dto::auth::AuthLoginDto = req.json().await.unwrap_or_default();
-            let auth = AuthService::new(db, jwt, rate, cfg.require_tmp, cfg.require_steam);
-            return match auth.login(&body, "127.0.0.1").await {
-                Ok(v) => ok_json(&v),
-                Err(e) => err_json(&e),
+            // 1) rate（RefCell 版，纯整数，无 JS 边界）
+            match rate.hit("127.0.0.1", &body.username, 5, std::time::Duration::from_secs(60)) {
+                Ok(()) => {}
+                Err(_) => return ok_json(&serde_json::json!({"stage": "rate-limited", "ok": false})),
+            }
+            // 2) db 读用户（v5 曾在此通过：200）
+            let user = match db.get_user_by_username(&body.username).await {
+                Ok(Some(u)) => u,
+                Ok(None) => {
+                    return ok_json(&serde_json::json!({"stage": "db-user-none", "query": body.username}))
+                }
+                Err(e) => {
+                    // 只取固定文案，**不**展开 e（其 any how 可能持 JsValue）
+                    return ok_json(&serde_json::json!({"stage": "db-read-err", "ok": false}));
+                }
             };
+            // 3) status
+            if user.status != vtc_core::constants::status::ACTIVE {
+                return ok_json(&serde_json::json!({"stage": "status-disabled", "status": user.status}));
+            }
+            // 4) PBKDF2（210k 迭代；纯 Rust 算法，无 JS 边界——但要排除它在 wasm 下的行为）
+            let pw_ok = match vtc_core::auth::password::verify_password(&body.password, &user.pass_hash) {
+                Ok(b) => b,
+                Err(e) => {
+                    return ok_json(&serde_json::json!({"stage": "verify-err", "ok": false, "err": e.to_string()}))
+                }
+            };
+            if !pw_ok {
+                return ok_json(&serde_json::json!({"stage": "bad-password", "ok": false}));
+            }
+            // 5) JWT issue（手写 HS256：hmac+sha2+b64url；验证它是否触发 JS 边界）
+            let (access, refresh) = match (
+                jwt.issue_access(&user.id, &user.username, &user.role, &user.status),
+                jwt.issue_refresh(&user.id, &user.username),
+            ) {
+                (Ok(a), Ok(r)) => (a, r),
+                (Err(e), _) => {
+                    return ok_json(&serde_json::json!({"stage": "jwt-err", "ok": false, "err": e.to_string()}))
+                }
+                (_, Err(e)) => {
+                    return ok_json(&serde_json::json!({"stage": "jwt-err", "ok": false, "err": e.to_string()}))
+                }
+            };
+            return ok_json(&serde_json::json!({
+                "stage": "jwt-ok",
+                "access": access,
+                "refresh": refresh,
+            }));
         }
         ("/auth/refresh", Method::Post) => {
             let body: dto::auth::AuthRefreshDto = req

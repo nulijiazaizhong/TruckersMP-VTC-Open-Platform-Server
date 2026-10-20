@@ -151,11 +151,14 @@ worker 形态**零 C 依赖**（D1/R2 走 CF 托管，无 SQLite、无本地存�
 | **使用 Cloudflare Access 保护** | **关** | API 服务不用，需要时再开。 |
 | **高级设置** | 默认即可 | 展开可设 Rust 版本等，不填也行。 |
 
-**构建命令**（整段粘贴）——装 Rust + wasm target，再跑仓库自带脚本（脚本会 build 并把
-`vtc_worker.wasm` + `index.js` 拷进 `dist/`；**两个文件必须都在**，否则 CF 当成「静态 Worker」绑不上 D1/R2）：
+**构建命令**（整段粘贴）——装 Rust + wasm target，再跑仓库自带脚本。
+⚠ **CF Builds 用 `/bin/sh`（dash）执行，不是 bash**：`source` 是 bash 内建，dash 不认
+（会报 `source: not found` 直接崩）。改用 **`.`（点号，POSIX 等价）** 或直接改 `PATH`。
+本命令直接改 `PATH` 指向 cargo bin，最稳（脚本会 build 并把 `vtc_worker.wasm` + `index.js`
+拷进 `dist/`，两个文件必须都在，否则 CF 当成「静态 Worker」绑不上 D1/R2）：
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
-  && source "$HOME/.cargo/env" \
+  && export PATH="$HOME/.cargo/bin:$PATH" \
   && rustup target add wasm32-wasip2 \
   && bash crates/vtc-worker/cf-build.sh
 ```

@@ -11,7 +11,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::ops::Deref;
-use worker::d1::D1Database;
+use worker::d1::{D1Database, D1PreparedStatement};
 // worker 0.8.6 不在顶层 re-export `JsValue`；`worker` 顶层 re-export 了 `wasm_bindgen`，
 // 故走 `worker::wasm_bindgen::JsValue`（`worker::js_sys::JsValue` 在 0.8.6 不可用）。
 use worker::wasm_bindgen::JsValue;
@@ -717,8 +717,22 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 "#;
 
-/// 启动时建表（idempotent）
+/// 启动时建表（idempotent）。
+/// ★ 用 `batch`（逐条 prepare）而**不是** `exec` 跑整个 MIGRATE_SQL：
+///   worker-rs 0.8.6 的 `D1Database::exec` 文档明确「多条查询用 `\n` 分隔」，它按**换行**
+///   分句。MIGRATE_SQL 的每个 CREATE TABLE 是**多行**（列定义换行），`exec` 按 `\n` 切会
+///   把 `CREATE TABLE IF NOT EXISTS team (`（第一行，以 `(` 结尾）当成独立一句执行 →
+///   D1 报 `incomplete input: SQLITE_ERROR`（列定义被切到下一行）。
+///   `batch` 逐条 `prepare`（每条 CREATE TABLE 是完整的 prepared statement，含内部换行），
+///   不受 `\n` 分句影响，多行 DDL 安全。
 pub async fn migrate(db: &D1Database) -> AppResult<()> {
-    db.exec(MIGRATE_SQL).await.map_err(err)?;
+    // 按 `;` 拆成单条语句（去掉空白/空串），逐条 prepare 后 batch 执行。
+    let statements: Vec<D1PreparedStatement> = MIGRATE_SQL
+        .split(';')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| db.prepare(s.to_string()))
+        .collect();
+    db.batch(statements).await.map_err(err)?;
     Ok(())
 }

@@ -127,18 +127,25 @@ worker 形态**零 C 依赖**（D1/R2 走 CF 托管，无 SQLite、无本地存�
 3. 记下桶名（`vtc-saves`）——后面「配置 Worker」绑定 R2 时选它。
 4. （可暂缓）存档与 DLC 模板都放这个桶；先建空桶也行，DLC 模板稍后从「④ 配路由」前的 ③ 步补传。
 
-#### ③ 创建 Worker 并上传 wasm（网页端）
+#### ③ 创建 Worker 并上传 wasm + index.js（网页端，**两个文件都要传**）
 
 1. 控制台左侧 **Workers & Pages → 创建 Worker**（Create Worker）。
-2. **关键：选「上传代码 / Upload」而不是「创建 Worker（粘贴 JS）」**——
-   直接上传一个 `.wasm` 文件（Cloudflare 支持「上传 Wasm 文件」模式）。
-3. 选 **上传 Wasm 文件**（Upload Wasm），把上面构建出的 `vtc_worker.wasm` 拖进去。
-   > 选「**作为 Worker 直接运行**」路径（不是「JS 里 `instantiate`」）——
-   > worker-rs 的 wasm 自带 `wasm-bindgen` 胶水，由 CF 运行时直接加载，**不需要**再写 JS 入口。
+2. **选「上传代码 / Upload code」**（不是「粘贴 JS / Create Worker」模板）。
+3. **同时上传两个文件**（这一步最容易出错，缺一不可）：
+   - `vtc_worker.wasm`（上面构建出的 wasm）
+   - `index.js`（仓库 [`crates/vtc-worker/index.js`](crates/vtc-worker/index.js)，**必须和 wasm 一起传**）
+   > **为什么必须有 `index.js`**：CF 区分「代码 Worker」（JS + 二进制）与「静态 Worker」。
+   > worker-rs 编出来是**纯 wasm**，若只传 `.wasm` 不传 JS，CF 会把它当成**静态 Worker**
+   > ——到「添加绑定」时就会报 **「不能将绑定添加到只有静态资产的 Worker」**（这正是你遇到的提示）。
+   > `index.js` 就两行（加载 wasm + `export { fetch }`），让 CF 认出这是**代码 Worker**，绑定就解锁了。
 4. 命名（如 `vtc-server`），点 **Deploy**。此时 worker 已上线，先得到
    `https://vtc-server.<你的子域>.workers.dev`。
 
-#### A4. 配置 Worker（网页端 Settings）
+> ⚠ 若你**已经**只传了 wasm、看到了「只有静态资产」的提示：
+> 进入该 Worker → **Settings → 代码 / 部署**，重新「上传代码」，把 `index.js` 和 `vtc_worker.wasm`
+> **两个一起**再传一次覆盖（或用控制台顶部的「上传新的 Wasm + 编辑 JS」），绑定入口即恢复。
+
+#### ④ 配置 Worker（网页端 Settings）
 
 进入刚建的 worker → **Settings**（设置）页，分四个子页配：
 

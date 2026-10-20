@@ -9,6 +9,13 @@
   // target/wasm32-wasip2/release/vtc_worker.wasm，部署前需拷到本目录（cf-build.sh 自动做）。
   "name": "vtc-server",
   "main": "index.js",
+  // build：wrangler dev/deploy 时自动跑（对照官方 Rust 模板的 build 命令）。
+  // cf-build.sh 编译 wasm 并把 index.js + vtc_worker.wasm 放进 dist/（= 本文件所在目录的产物）。
+  // 注意：GitHub Actions 流水线里我们用独立的 staging 步（见 .github/workflows/deploy.yml），
+  // 不依赖此字段；此字段主要服务「本地 wrangler deploy」与「CF Builds 直接读 wrangler.jsonc」两种场景。
+  "build": {
+    "command": "bash cf-build.sh"
+  },
   "compatibility_date": "2025-08-01",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,

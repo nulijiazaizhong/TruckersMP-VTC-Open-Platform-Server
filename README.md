@@ -228,70 +228,61 @@ curl -X POST $B/api/v1/seed -H "authorization: Bearer <TOKEN>" \
      -H 'content-type: application/json' -d '{"password":"新强口令"}'
 ```
 
-### 从 Git 仓库部署（Cloudflare Builds / GitHub Actions）
+### 从 Git 仓库部署（推荐：GitHub Actions 全自动流水线）
 
 > 上面的 ①–⑦ 是「手动上传」（本地 build 出 wasm 拖进去）。如果你要**连 GitHub 仓库、push 即部署**，
 > 用这一节。**前置**：已建好 D1/R2（同 ①②）、已在 Cloudflare 配好对应 Worker 的绑定与 secret（同 ④）。
 > 仓库直连只替代「③ 上传 wasm」这一步——把「手动拖文件」换成「CI 自动 build 后部署」。
+>
+> 本流程对照 [Cloudflare 官方 Rust 文档](https://developers.cloudflare.com/workers/languages/rust/)：
+> 官方部署 = `npx wrangler deploy`（wrangler 调 build 命令产出 wasm + JS 入口再上传），
+> 并靠 `[profile.release] lto/strip/codegen-units` 控制 wasm 体积（本仓库已配，见
+> `crates/vtc-worker/Cargo.toml`）。worker-rs 的 wasm 由 `wasm-bindgen` 导出 `fetch` 等事件，
+> 需一个 JS 入口加载它——本仓库用 `index.js` 手动复刻了官方 `worker-build` 的「生成 JS 入口」步
+> （wasip2 + `nodejs_compat` 的新式 worker 不再需要 `worker-build` 的 webpack 打包）。
 
-**为什么需要仓库里的 `cf-build.sh`**：Cloudflare 的「连接 Git 仓库」构建，预置镜像是
-Node/Python/Java/静态，**没有 Rust**。所以自定义构建命令直接跑仓库里的
-[`crates/vtc-worker/cf-build.sh`](crates/vtc-worker/cf-build.sh)：
-`cargo build -p vtc-worker --target wasm32-wasip2 --release` → 把 `vtc_worker.wasm` + `index.js`
-拷进产物目录。产物里**必须同时有 `index.js`**（否则又是「只有静态资产」、绑不上 D1/R2，见 ③）。
+**为什么 CF 原生「连接 Git 仓库」对 Rust 不顺手**：Cloudflare Builds 的预置构建镜像是
+Node/Python/Java/静态，**没有 Rust 镜像**，要在 Build command 里现场装 rustup（脆弱）。
+因此**推荐 GitHub Actions**（`dtolnay/rust-toolchain` 是成熟的 rust 安装方式），
+仓库已内置现成流水线 [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)。
 
-#### 方式 1 · Cloudflare Builds（Dashboard 内「连接 Git 仓库」）
+#### 方式 1（推荐）· GitHub Actions 全自动（已入库，push 即部署）
 
+流水线逻辑（见 [`deploy.yml`](.github/workflows/deploy.yml)）：
+- **任意 PR / 推送 `crates/**`** → `build` job：`cargo build -p vtc-worker --target wasm32-wasip2 --release`
+  作**编译门**（编不过即红，挡在合并前）。
+- **push `main`** → `deploy` job：复用/重编 wasm → 把 `index.js` + `vtc_worker.wasm` +
+  `wrangler.jsonc` 组装进 `crates/vtc-worker/dist/` → 官方
+  [`cloudflare/wrangler-action`](https://github.com/cloudflare/wrangler-action) 跑 `wrangler deploy`
+  上传（`main=index.js`，wasm+JS 一起传 = 「代码 Worker」，D1/R2 绑定全部生效）。
+
+**启用只需两步**（流水线已在仓库里，无需再贴 YAML）：
+1. GitHub 仓库 **Settings → Secrets and variables → actions** 加两个 secret：
+   - `CLOUDFLARE_API_TOKEN`（CF API Token，需 **Workers:Edit** 权限）
+   - `CLOUDFLARE_ACCOUNT_ID`（CF Account ID）
+2. （一次性）让 `wrangler.jsonc` 指向真实资源：填实 `<D1_DATABASE_ID>` / `<ZONE_ID>`，
+   **或**在 deploy 步加 `flags: --remote-config`（复用 Dashboard 已建的 D1/R2 与绑定，免填占位符）。
+
+之后 push `main` 即自动构建 + 部署；开 PR 时自动跑编译门。
+
+#### 方式 2 · Cloudflare Builds（Dashboard 内「连接 Git 仓库」，备选）
+
+若坚持用 CF 原生 Builds（不依赖 GitHub Actions）：
 1. Dashboard → **Workers & Pages → 选你的 worker（或 Create）→ Settings → Build**（或「Connect Git repository」）。
 2. 连接 GitHub 仓库 `TruckersMP-VTC-Open-Platform-Server`，分支 `main`。
-3. 构建配置（Build settings）：
-   - **Build command（构建命令）**：`crates/vtc-worker/cf-build.sh`
-     （若 CF 的镜像不带 Rust，选带 Rust 的 build image；或在 Build command 前加
-     `curl https://sh.rustup.rs -sSf | sh -s -- -y && export PATH=$HOME/.cargo/bin:$PATH && rustup target add wasm32-wasip2 &&`）
-   - **Output directory（产物目录）**：`crates/vtc-worker/dist`（`cf-build.sh` 默认输出到此；
-     或用 `OUTPUT=... cf-build.sh` 覆盖成 CF 要求的绝对路径）
-   - **Entry point / 入口文件**：`index.js`
-4. 保存后，仓库 `main` 每次 push 自动构建并部署。绑定（DB/BUCKET）、secret、`nodejs_compat`
-   在 worker 的 Settings 里配一次即可，Builds 复用。
+3. 构建配置：
+   - **Build command**：先装 Rust 再跑仓库脚本（CF 镜像默认无 Rust）：
+     `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal && source "$HOME/.cargo/env" && rustup target add wasm32-wasip2 && bash crates/vtc-worker/cf-build.sh`
+   - **Deploy command**：`npm i -g wrangler@3 && cp crates/vtc-worker/wrangler.jsonc crates/vtc-worker/dist/ && cd crates/vtc-worker/dist && wrangler deploy`
+   - **Preview command**：留空；「启用预览构建」关（worker-rs 本地预览易报错，非必需）。
+   - **Build image**：选带 Rust 的（若 CF 提供），否则靠上面 Build command 现场装。
+4. `wrangler.jsonc` 的 `build.command` 字段（`bash cf-build.sh`）供「CF 直接读 wrangler 配置」场景自举；
+   `main=index.js` 保证部署的是代码 Worker。
 
-#### 方式 2 · GitHub Actions（最稳，推荐 CI/CD）
-
-仓库加 `.github/workflows/deploy.yml`，用官方 [`cloudflare/wrangler-action`](https://github.com/cloudflare/wrangler-action)，
-push 到 `main` 即部署（需要仓库 secret：`CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`）：
-
-```yaml
-name: deploy-vtc-worker
-on:
-  push:
-    branches: [main]
-    paths: ["crates/**", "Cargo.toml", "Cargo.lock"]
-jobs:
-  build-and-deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with: { targets: wasm32-wasip2 }
-      # 构建 wasm（cf-build.sh 同时把 index.js 放进 dist/）
-      - name: Build wasm
-        run: |
-          chmod +x crates/vtc-worker/cf-build.sh
-          OUTPUT=dist crates/vtc-worker/cf-build.sh
-      - uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          # 部署产物（wasm + index.js）
-          command: deploy
-          # 指向 worker 配置（crates/vtc-worker/wrangler.jsonc 已含 bindings/vars/路由模板）
-          workingDirectory: crates/vtc-worker
-```
-
-> **说明**：`wrangler deploy` 走 `wrangler.jsonc`（已配好 `DB`/`BUCKET` 绑定、`nodejs_compat`、
-> 路由），它会自动把 `main` 指向的 JS（`index.js`）与 `vtc_worker.wasm` 一起部署——这正是
-> 「代码 Worker」，绑定全部生效。`wrangler.jsonc` 里的 `<D1_DATABASE_ID>` / `<ZONE_ID>` 占位符
-> 需先填实（`wrangler d1 create` / `wrangler whoami` 可查），或改用 `wrangler deploy --remote-config`
-> 复用 Dashboard 已建的资源。两种方式（Builds / Actions）二选一即可，**不要同时**给同一 worker 配。
+> **两种方式二选一**，**不要同时**给同一 worker 配（会互相覆盖部署）。
+> `wrangler.jsonc` 的 `<D1_DATABASE_ID>` / `<ZONE_ID>` 占位符要么填实，要么用 `--remote-config`
+> 复用 Dashboard 资源。`JWT_SECRET` / `VTC_STORAGE_SIGN_KEY` / `VTC_ADMIN_PASSWORD` 三个 secret
+> 在 worker 的 Settings → Variables and Secrets 里配好（构建/部署不自动带）。
 
 ### 形态对照（同一份 service，两种后端）
 

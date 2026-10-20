@@ -1,0 +1,125 @@
+# =============================================================================
+# VTC 服务端 · Cloudflare Workers 自动部署流水线（worker-rs / wasm32-wasip2）
+#
+# 对照 Cloudflare 官方 Rust 文档（developers.cloudflare.com/workers/languages/rust/）：
+#   官方部署 = `npx wrangler deploy`（wrangler 调 build 命令产出 wasm + JS 入口再上传）。
+#   本流水线是其「GitHub 链接 + 全自动」版：
+#     - PR / 任意分支推送 crates/**  → 编译门（cargo build wasm，失败即红）
+#     - push main                    → 编译 + wrangler deploy 到 Cloudflare
+#
+# 需要在 GitHub 仓库 Settings → Secrets and variables → actions 配置：
+#   CLOUDFLARE_API_TOKEN    —— CF API Token（需 Workers:Edit 权限）
+#   CLOUDFLARE_ACCOUNT_ID   —— CF Account ID
+#
+# 前置资源（一次性，在 CF Dashboard 或 wrangler 建好）：
+#   - D1 数据库（binding 名 `DB`）+ R2 桶（binding 名 `BUCKET`）
+#   - wrangler.jsonc 里 <D1_DATABASE_ID> / <ZONE_ID> 占位符填实，
+#     或部署时用 --remote-config 复用 Dashboard 已配资源（见下面 deploy 步）。
+# =============================================================================
+name: deploy-vtc-worker
+
+on:
+  pull_request:
+    paths: ["crates/**", "Cargo.toml", "Cargo.lock", ".github/workflows/deploy.yml"]
+  push:
+    branches: [main]
+    paths: ["crates/**", "Cargo.toml", "Cargo.lock", ".github/workflows/deploy.yml"]
+
+# 同一分支只保留一个在跑（取消旧的）
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------- 编译门：PR 与 main 都跑，保证 wasm 能编过 ----------
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 官方推荐的 Rust 安装方式（dtolnay/rust-toolchain），并加 wasm target
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      # sccache 缓存 cargo 构建（PR 间复用，加速）
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/wasm32-wasip2
+          key: cargo-wasm-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'crates/**/Cargo.toml') }}
+          restore-keys: |
+            cargo-wasm-${{ runner.os }}-
+
+      - name: Build wasm (release)
+        run: cargo build -p vtc-worker --target wasm32-wasip2 --release
+
+      - name: Show artifact size
+        run: |
+          ls -lh target/wasm32-wasip2/release/vtc_worker.wasm
+          # 上传产物供 deploy job 复用（避免重复编译）
+      - uses: actions/upload-artifact@v4
+        if: github.ref == 'refs/heads/main'
+        with:
+          name: vtc-worker-wasm
+          path: target/wasm32-wasip2/release/vtc_worker.wasm
+          if-no-files-found: error
+
+  # ---------- 部署：仅 push main ----------
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/wasm32-wasip2
+          key: cargo-wasm-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'crates/**/Cargo.toml') }}
+          restore-keys: |
+            cargo-wasm-${{ runner.os }}-
+
+      # 复用 build job 的产物；若无（首次/缓存 miss）则本地重编
+      - uses: actions/download-artifact@v4
+        if: ${{ !env.ARTIFACT_OK }}
+        with:
+          name: vtc-worker-wasm
+          path: target/wasm32-wasip2/release/
+      - name: Ensure wasm present (fallback build)
+        run: |
+          if [[ ! -f target/wasm32-wasip2/release/vtc_worker.wasm ]]; then
+            cargo build -p vtc-worker --target wasm32-wasip2 --release
+          fi
+
+      # 组装 wrangler 部署目录：index.js + vtc_worker.wasm + wrangler.jsonc
+      - name: Stage worker dir
+        run: |
+          cd crates/vtc-worker
+          mkdir -p dist
+          cp index.js          dist/index.js
+          cp wrangler.jsonc    dist/wrangler.jsonc
+          cp ../../../target/wasm32-wasip2/release/vtc_worker.wasm dist/vtc_worker.wasm
+          ls -lh dist
+
+      # 官方部署方式：wrangler deploy（读 wrangler.jsonc，main=index.js，
+      # 把 index.js + vtc_worker.wasm 作为「代码 Worker」一起上传 → 绑定生效）
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy
+          workingDirectory: crates/vtc-worker/dist
+          # 若 Dashboard 已建好 D1/R2 且配好绑定/secret，可改用远程配置免填占位符：
+          # flags: --remote-config

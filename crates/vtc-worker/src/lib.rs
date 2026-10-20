@@ -244,62 +244,19 @@ async fn fetch_inner(mut req: Request, env: Env, _ctx: Context) -> Result<Respon
             };
         }
         ("/auth/login", Method::Post) => {
-            // ★ v8 分段探针：**每个**分支都返回 plain `ok_json`（**不**走 `Err`/`to_js_value`），
-            //   这样「到达哪个 stage」直接暴露是哪一步在 wasm↔JS 边界触发异常（worker-rs 0.8.6
-            //   `Error::Internal(JsValue)`/`UnknownJsError{original:JsValue}` → `to_js_value` 把
-            //   原始 JS 错误对象 clone 回边界 → CF `__wbg_new` Critical，即 v7 的 1101）。
-            //   顺序：rate(RefCell) → db读 → status → **PBKDF2** → **JWT**。
-            //   - 停在 password-*：崩溃在 PBKDF2 之前（db/status）。
-            //   - 停在 jwt-ok：全链路通 → 恢复完整 auth.login，剩 D1 写 / 密码对不对。
+            // ★ 完整登录（P0 正式路径）。历史教训（本地 wasm 复现实锤）：
+            //   CF login 反复 1101 的真正根因**不是**锁、**不是** D1、**不是** `to_js_value`，
+            //   而是 **`std::time::{Instant,SystemTime}` 在 `wasm32-unknown-unknown` 上直接
+            //   panic**「time not implemented on this platform」→ `__wbg_new` Critical。
+            //   修复 = ① workspace `chrono` 加 `wasmbind`（`Utc::now()`/`Instant` 走 JS 时钟）
+            //   ② `rate.rs` 改走 `chrono::Utc::now()`（不再碰 `std::time`）。
+            //   全链路（rate→db读→status→PBKDF2→JWT→D1写→audit→member）本地 wasm 已 200 跑通。
             let body: dto::auth::AuthLoginDto = req.json().await.unwrap_or_default();
-            // 1) rate（RefCell 版，纯整数，无 JS 边界）
-            match rate.hit("127.0.0.1", &body.username, 5, std::time::Duration::from_secs(60)) {
-                Ok(()) => {}
-                Err(_) => return ok_json(&serde_json::json!({"stage": "rate-limited", "ok": false})),
-            }
-            // 2) db 读用户（v5 曾在此通过：200）
-            let user = match db.get_user_by_username(&body.username).await {
-                Ok(Some(u)) => u,
-                Ok(None) => {
-                    return ok_json(&serde_json::json!({"stage": "db-user-none", "query": body.username}))
-                }
-                Err(e) => {
-                    // 只取固定文案，**不**展开 e（其 any how 可能持 JsValue）
-                    return ok_json(&serde_json::json!({"stage": "db-read-err", "ok": false}));
-                }
+            let auth = AuthService::new(db, jwt, rate, cfg.require_tmp, cfg.require_steam);
+            return match auth.login(&body, "127.0.0.1").await {
+                Ok(v) => ok_json(&v),
+                Err(e) => err_json(&e),
             };
-            // 3) status
-            if user.status != vtc_core::constants::status::ACTIVE {
-                return ok_json(&serde_json::json!({"stage": "status-disabled", "status": user.status}));
-            }
-            // 4) PBKDF2（210k 迭代；纯 Rust 算法，无 JS 边界——但要排除它在 wasm 下的行为）
-            let pw_ok = match vtc_core::auth::password::verify_password(&body.password, &user.pass_hash) {
-                Ok(b) => b,
-                Err(e) => {
-                    return ok_json(&serde_json::json!({"stage": "verify-err", "ok": false, "err": e.to_string()}))
-                }
-            };
-            if !pw_ok {
-                return ok_json(&serde_json::json!({"stage": "bad-password", "ok": false}));
-            }
-            // 5) JWT issue（手写 HS256：hmac+sha2+b64url；验证它是否触发 JS 边界）
-            let (access, refresh) = match (
-                jwt.issue_access(&user.id, &user.username, &user.role, &user.status),
-                jwt.issue_refresh(&user.id, &user.username),
-            ) {
-                (Ok(a), Ok(r)) => (a, r),
-                (Err(e), _) => {
-                    return ok_json(&serde_json::json!({"stage": "jwt-err", "ok": false, "err": e.to_string()}))
-                }
-                (_, Err(e)) => {
-                    return ok_json(&serde_json::json!({"stage": "jwt-err", "ok": false, "err": e.to_string()}))
-                }
-            };
-            return ok_json(&serde_json::json!({
-                "stage": "jwt-ok",
-                "access": access,
-                "refresh": refresh,
-            }));
         }
         ("/auth/refresh", Method::Post) => {
             let body: dto::auth::AuthRefreshDto = req

@@ -27,7 +27,10 @@ rand = "0.9"
 hmac = "0.12"
 
 # --- 时间 ---
-chrono = { version = "0.4", features = ["serde"] }
+# `wasmbind`：让 `Utc::now()`/`Instant` 在 wasm32 上走 JS `performance.now()`（否则 std
+# `unsupported::time` 直接 panic「time not implemented」→ CF login 1101 根因）。
+# 该特性内部 `#[cfg(target_arch="wasm32")]` 门控，Docker/native 构建**完全不受影响**。
+chrono = { version = "0.4", features = ["serde", "wasmbind"] }
 time = { version = "0.3", features = ["serde", "macros"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 

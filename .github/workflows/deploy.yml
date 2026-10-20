@@ -113,13 +113,26 @@ jobs:
           cp ../../../target/wasm32-wasip2/release/vtc_worker.wasm dist/vtc_worker.wasm
           ls -lh dist
 
-      # 官方部署方式：wrangler deploy（读 wrangler.jsonc，main=index.js，
-      # 把 index.js + vtc_worker.wasm 作为「代码 Worker」一起上传 → 绑定生效）
-      - uses: cloudflare/wrangler-action@v3
+      # 选部署方案（占位符处理二选一）：
+      #   A. 填实 wrangler.jsonc 的 <D1_DATABASE_ID>/<ZONE_ID>        → deploy
+      #   B. Dashboard 已配好 D1/R2 绑定                              → deploy --remote-config
+      #      （wrangler 从 Cloudflare 拉回该 worker 已保存的 bindings/vars/secrets，
+      #        覆盖本地 wrangler.jsonc 的 bindings/routes → 占位符免填也不报错）
+      # 在 GitHub 仓库 Settings → Variables 设 CF_USE_REMOTE_CONFIG = "true" 即走 B。
+      - id: pick
+        run: |
+          if [[ "${{ vars.CF_USE_REMOTE_CONFIG }}" == "true" ]]; then
+            echo "deploy_cmd=deploy --remote-config" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy_cmd=deploy" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 官方部署：wrangler-action 注入 CLOUDFLARE_API_TOKEN/ACCOUNT_ID 并装 wrangler，
+      # `command` 输入接收「deploy」或「deploy --remote-config」（wrangler-action **没有** `flags`
+      # 输入，额外参数只能写进 `command`）。main=index.js，wasm+JS 一起传 = 代码 Worker。
+      - uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: deploy
+          command: ${{ steps.pick.outputs.deploy_cmd }}
           workingDirectory: crates/vtc-worker/dist
-          # 若 Dashboard 已建好 D1/R2 且配好绑定/secret，可改用远程配置免填占位符：
-          # flags: --remote-config

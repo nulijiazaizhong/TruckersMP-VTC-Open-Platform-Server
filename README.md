@@ -260,8 +260,20 @@ Node/Python/Java/静态，**没有 Rust 镜像**，要在 Build command 里现�
 1. GitHub 仓库 **Settings → Secrets and variables → actions** 加两个 secret：
    - `CLOUDFLARE_API_TOKEN`（CF API Token，需 **Workers:Edit** 权限）
    - `CLOUDFLARE_ACCOUNT_ID`（CF Account ID）
-2. （一次性）让 `wrangler.jsonc` 指向真实资源：填实 `<D1_DATABASE_ID>` / `<ZONE_ID>`，
-   **或**在 deploy 步加 `flags: --remote-config`（复用 Dashboard 已建的 D1/R2 与绑定，免填占位符）。
+2. 处理 `wrangler.jsonc` 里两个占位符 `<D1_DATABASE_ID>` / `<ZONE_ID>`（二选一）：
+   - **方案 A · 填实占位符**：`<D1_DATABASE_ID>` ← D1 库的 Database ID（Dashboard → D1 →
+     选库 → **Settings** 可见，或 `npx wrangler d1 list`）；`<ZONE_ID>` ← 你的域名 zone id
+     （**仅用自定义域名路由才需要**，Dashboard → 域名 → Overview → **API ID**，或
+     `npx wrangler whoami --json`）。> 若暂只用 `workers.dev` 子域，建议先把 `routes` 数组删掉
+     > （`workers_dev: true` 已够联调），否则 deploy 会因「zone 无权限」报错。
+   - **方案 B · `--remote-config` 复用 Dashboard 配置（推荐，免填占位符）**：
+     **前提**是已在 Dashboard 对这个 Worker 配好 `DB`/`BUCKET` 绑定（见上文 ④）。
+     然后在 GitHub 仓库 **Settings → Variables** 加 `CF_USE_REMOTE_CONFIG = "true"`，
+     流水线 deploy 步就自动跑 `wrangler deploy --remote-config`——wrangler 从 Cloudflare
+     拉回该 worker 已保存的 bindings/vars/secrets **覆盖**本地 `wrangler.jsonc` 的
+     bindings/routes，占位符免填也不报错。
+     > 注意：`cloudflare/wrangler-action` **没有 `flags` 输入**，`--remote-config` 写在
+     > `command` 里（`deploy --remote-config`），本流水线已处理好。
 
 之后 push `main` 即自动构建 + 部署；开 PR 时自动跑编译门。
 
@@ -280,8 +292,10 @@ Node/Python/Java/静态，**没有 Rust 镜像**，要在 Build command 里现�
    `main=index.js` 保证部署的是代码 Worker。
 
 > **两种方式二选一**，**不要同时**给同一 worker 配（会互相覆盖部署）。
-> `wrangler.jsonc` 的 `<D1_DATABASE_ID>` / `<ZONE_ID>` 占位符要么填实，要么用 `--remote-config`
-> 复用 Dashboard 资源。`JWT_SECRET` / `VTC_STORAGE_SIGN_KEY` / `VTC_ADMIN_PASSWORD` 三个 secret
+> `wrangler.jsonc` 的 `<D1_DATABASE_ID>` / `<ZONE_ID>` 占位符：要么**填实**，要么在 deploy 命令里
+> 加 `--remote-config`（即 `wrangler deploy --remote-config`）复用 Dashboard 资源——注意它是
+> **deploy 的子命令参数**，不是 wrangler-action 的 `flags` 输入（action 无此字段）。
+> `JWT_SECRET` / `VTC_STORAGE_SIGN_KEY` / `VTC_ADMIN_PASSWORD` 三个 secret
 > 在 worker 的 Settings → Variables and Secrets 里配好（构建/部署不自动带）。
 
 ### 形态对照（同一份 service，两种后端）

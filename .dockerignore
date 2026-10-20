@@ -1,0 +1,32 @@
+# 构建上下文瘦身：排除不需要进镜像的大文件 / 临时产物。
+# 上次 build context 传了 1.03GB（target/ 编译缓存 + prebuilt/ + smoke 测试库），排除后大幅加快。
+
+# Rust 编译缓存（容器内会重新编译，不需要宿主机的 target/）
+target/
+**/target/
+
+# 预编译 sqlite（Windows MSVC 用，Docker 里走 system sqlite，用不上）
+prebuilt/
+
+# 临时探针工程
+tmp_probe/
+
+# 本地 smoke 测试产生的 db / 日志
+smoke_vtc.db*
+smoke-test.db
+smoke-err.log
+*.db-shm
+*.db-wal
+
+# 源码管理 / 文档 / CI（容器内用不上）
+.git/
+.gitignore
+.github/
+*.md
+
+# Worker 构建产物（Docker 形态不构建 wasm）
+crates/vtc-worker/dist/
+
+# 注意：map-dlc/ **不要** 排除 —— 它要 COPY 进镜像。
+# .env 排除（密钥不进镜像；compose 运行时注入）
+.env

@@ -32,9 +32,14 @@ time = { version = "0.3", features = ["serde", "macros"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 
 # --- 持久化（Docker 形态） ---
-# 注意：bundled=false，使用预编译 sqlite3.lib（sandbox 下 MSVC cl 无法被 cc-rs 调用）
-# 预编译库在 vtc-rs/prebuilt/sqlite3.lib，通过 SQLITE3_LIB_DIR + SQLITE3_STATIC 注入
-rusqlite = { version = "0.32" }
+# bundled=true：libsqlite3-sys 自带 SQLite C 源码，用 cc-rs 现场编译，**不**依赖系统 libsqlite3。
+# 关键原因：musl 静态链接下，系统 libsqlite3.a（Debian libtool 归档）常混入 glibc 的
+# scrt1.o/crti.o 启动对象，链进 musl 二进制后 SQLite 首次调用即 SIGSEGV（code 139）。
+# bundled 从根上避开——自己编 C 源码，纯 musl 工具链产物。副作用（正向）：
+#   - Windows 本地构建也不再需要 prebuilt/sqlite3.lib + SQLITE3_LIB_DIR 注入（cc 直接编）。
+#   - worker 形态不受影响（vtc-worker 用 D1，根本不依赖 rusqlite）。
+# 前提：构建环境要有 C 编译器（Docker 里 apt 装 build-essential；Windows 用 MSVC/clang）。
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde_urlencoded = "0.7"
 
 [profile.release]

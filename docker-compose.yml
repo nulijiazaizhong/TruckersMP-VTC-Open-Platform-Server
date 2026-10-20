@@ -1,11 +1,12 @@
 # VTC 服务端 · Rust · Docker Compose
-# 与 .NET 版共用同一套 .env / map-dlc（上层 ../map-dlc）
+# 独立项目自包含：.env / map-dlc 均在仓库内，部署只需本目录。
+# 用法：在本目录（仓库根）执行  docker compose up
 
 services:
   vtc-api:
     build:
-      context: ..
-      dockerfile: docker/Dockerfile
+      context: .
+      dockerfile: Dockerfile
     image: vtc-rs/api:latest
     ports:
       - "${PORT:-8731}:8731"
@@ -23,6 +24,9 @@ services:
       - RUST_LOG=${RUST_LOG:-info}
     volumes:
       - vtc-data:/data
+      # map-dlc 模板已随仓库 COPY 进镜像（/app/map-dlc），独立部署无需外部目录。
+      # 若想热更新模板而不重建镜像，手动取消下面这行注释，并把宿主路径改成你的模板目录：
+      #   - /path/to/your/map-dlc:/app/map-dlc:ro
     restart: unless-stopped
     # 健康检查：distroless 无 shell/curl，用平台层 TCP 探测（此处留空，
     # 生产建议 K8s livenessProbe tcpSocket:8731 或加 curl sidecar httpGet /api/v1/health）

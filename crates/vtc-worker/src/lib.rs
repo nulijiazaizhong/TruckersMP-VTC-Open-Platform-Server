@@ -244,75 +244,20 @@ async fn fetch_inner(mut req: Request, env: Env, _ctx: Context) -> Result<Respon
             };
         }
         ("/auth/login", Method::Post) => {
-            // ★ 分段探针 v3：手动重放 auth_service.login 的步骤，每步带 stage 标记 +
-            // 错误捕获，一次部署即可看到「卡在哪一步」。不返回 token（安全）。
-            // 已确认：body 解析 OK、D1 读用户 OK（admin/Active）。本次覆盖 密码→JWT→写库→组DTO。
+            // ★ 恢复真实完整登录（rate 已修：Mutex + SystemTime，wasm 安全；
+            // 经 v2/v4/v5 二分探针实锤：唯一崩溃源是 rate.hit 的 RwLock/Instant）。
             let body: dto::auth::AuthLoginDto = req.json().await.unwrap_or_default();
-            let stage_err = |stage: &str, e: &AppError| {
-                serde_json::json!({"stage": stage, "ok": false, "err": e.to_string(), "status": e.status()})
+            let auth = AuthService::new(
+                db.clone(),
+                jwt.clone(),
+                rate.clone(),
+                cfg.require_tmp,
+                cfg.require_steam,
+            );
+            return match auth.login(&body, "127.0.0.1").await {
+                Ok(v) => ok_json(&v),
+                Err(e) => err_json(&e),
             };
-            // ★ v5 隔离：去掉 rate.hit 与 status 检查（v4 比 v2 多出的两项，v4 崩、v2 过 →
-            // 元凶在二者之一）。本探针只保留 body + db读（=v2，已证明安全）+ 固定返回。
-            // 若 v5 过 → 确认元凶是 rate.hit 或 status；下一刀逐个加回定位。
-            let user = match db.get_user_by_username(&body.username).await {
-                Ok(Some(u)) => u,
-                Ok(None) => return ok_json(&serde_json::json!({"stage":"db-user-none","query":body.username})),
-                Err(e) => return err_json(&e),
-            };
-            let _ = &body;
-            return ok_json(&serde_json::json!({
-                "stage":"v5-isolated","ok":true,"username":user.username,"status":user.status,
-            }));
-            #[allow(unreachable_code)]
-            {
-            // 5) JWT 签发
-            let access = match jwt.issue_access(&user.id, &user.username, &user.role, &user.status) {
-                Ok(a) => a,
-                Err(e) => return ok_json(&stage_err("jwt-access", &e)),
-            };
-            let refresh = match jwt.issue_refresh(&user.id, &user.username) {
-                Ok(r) => r,
-                Err(e) => return ok_json(&stage_err("jwt-refresh", &e)),
-            };
-            // 6) D1 写：吊销旧 refresh
-            if let Err(e) = db.revoke_all_for_user(&user.id).await {
-                return err_json(&e);
-            }
-            // 7) D1 写：插入新 refresh（探针只需验证 D1 写成功，thash 用占位长度串）
-            {
-                let rt = vtc_core::domain::RefreshToken {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    token_hash: "probe-".repeat(16),
-                    user_id: user.id.clone(),
-                    expires_at: chrono::Utc::now()
-                        + chrono::Duration::days(vtc_core::constants::jwt::REFRESH_TTL_DAYS),
-                    revoked_at: None,
-                    replaced_by: None,
-                    created_at: chrono::Utc::now(),
-                };
-                if let Err(e) = db.insert_refresh_token(&rt).await {
-                    return err_json(&e);
-                }
-            }
-            // 8) D1 写：last_login
-            if let Err(e) = db.update_user_last_login(&user.id, chrono::Utc::now()).await {
-                return err_json(&e);
-            }
-            // 9) D1 读：member
-            let member = match db.get_member_by_user(&user.id).await {
-                Ok(m) => m,
-                Err(e) => return err_json(&e),
-            };
-            // 10) 组 DTO（不返回 token 本体，只报成功 + 长度）
-            let _ = access;
-            let _ = refresh;
-            let _ = member;
-            return ok_json(&serde_json::json!({
-                "stage":"all-done","ok":true,
-                "username":user.username,"role":user.role,
-                "access_len":access.len(),"refresh_len":refresh.len(),
-            }));
-            } // end unreachable block
         }
         ("/auth/refresh", Method::Post) => {
             let body: dto::auth::AuthRefreshDto = req

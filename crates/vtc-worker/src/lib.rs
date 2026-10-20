@@ -7,7 +7,13 @@
 //! 后端装配（从 `worker::Env` 拿 D1 / R2 binding）：
 //! - D1  → `db::D1Db`（本地 wrapper 实现 `Db`；内部 `Arc<D1Database>`）
 //! - R2  → `storage::R2Storage`（实现 `Storage`；`env.get_binding::<Bucket>(name)`）
-//! - Push→ `push::InMemPush`（push.rs，P0 存根；P1 换 Durable Objects）
+//!
+//! **首次访问自愈（免手动建表 / 免 scheduled）**：`fetch` 第一件事是 `ensure_ready`——
+//! 若 D1 里还没有 `team` 表就自动跑幂等 `db::migrate`（13 张表），缺 admin 就 seed
+//! admin（密码取绑定 `VTC_ADMIN_PASSWORD`，缺省 `ChangeMe123!`）+ 默认车队。判据是
+//! 「`DB` / `BUCKET` 绑定存在与否」而非探测 `SELECT`，幂等且冷启动只跑一次（约 +0.5s）。
+//! 这样网页端部署**既不手动粘贴 SQL、也不用配 scheduled cron**：建好 D1/R2、绑名、
+//! 上传 wasm，第一次访问即自动把库建好并种进 admin。P1 可换回 `scheduled` 事件预热。
 //!
 //! **DLC 模板源（worker 无文件系统）**：local 形态 `DlcService::load_template` 读本地
 //! `map-dlc/<major>.<game>.txt`；worker 形态没有本地磁盘，模板改存 **R2**
@@ -23,13 +29,12 @@
 //! - `#[worker::event(fetch)]` 要求**恰好 3 个参数**：`(req: Request, env: Env, ctx: Context)`。
 
 mod db;
-mod push;
 mod storage;
 
 use std::sync::Arc;
 
 use serde::Deserialize;
-use vtc_core::backend::Storage;
+use vtc_core::backend::{Db as _Db, Storage};
 use vtc_core::auth::jwt::Claims;
 use vtc_core::constants::role;
 use vtc_core::dto;
@@ -46,6 +51,9 @@ const D1_BINDING: &str = "DB";
 const R2_BINDING: &str = "BUCKET";
 /// DLC 模板在 R2 里的前缀（部署时把 map-dlc/ 模板上传到此）
 const DLC_TPL_PREFIX: &str = "dlc-templates/";
+/// 种子 admin 的初始密码绑定名（缺省 `ChangeMe123!`，生产建议改为随机强口令）
+const ADMIN_PWD_BINDING: &str = "VTC_ADMIN_PASSWORD";
+const DEFAULT_ADMIN_PWD: &str = "ChangeMe123!";
 
 // ---------- 响应辅助（worker::Error） ----------
 
@@ -152,15 +160,26 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response, Er
     // 去掉 /api/v1 前缀
     let path = path.strip_prefix("/api/v1").unwrap_or(&path).to_string();
 
-    // 装配后端（D1 + R2；Push 内存存根）。
+    // 装配后端（D1 + R2）。`?` 在绑定缺失（未配 DB/BUCKET）时提前返回，避免空指针。
     let d1: D1Database = env.d1(D1_BINDING)?;
     let bucket: Bucket = env.get_binding::<Bucket>(R2_BINDING)?;
     let cfg = worker_config();
-    let (jwt, rate) = worker_services(&cfg);
     let db: Arc<db::D1Db> = Arc::new(db::D1Db::new(d1));
     let storage: Arc<storage::R2Storage> =
         Arc::new(storage::R2Storage::new(bucket, &cfg.public_base));
-    let _push: Arc<push::InMemPush> = Arc::new(push::InMemPush::new()); // P0 存根，P1 换 DO
+
+    // ★ 首次访问自愈：建表 + seed（admin / 默认车队），幂等，仅冷启动一次（约 +0.5s）。
+    // 网页端部署因此免「手动粘贴 SQL」与「配 scheduled cron」。
+    let pwd = match env.secret(ADMIN_PWD_BINDING) {
+        Ok(s) => s.to_string(),
+        Err(_) => String::new(),
+    };
+    if ensure_ready(&db, &pwd).await.is_err() {
+        return err_json(&AppError::Internal(anyhow::anyhow!(
+            "D1 初始化失败（建表/种子），请确认 `DB` 绑定指向可用 D1"
+        )));
+    }
+    let (jwt, rate) = worker_services(&cfg);
 
     // 1) storage 中转（/api/v1/storage/*，HMAC sig 鉴权，无需 Bearer）
     if path == "/storage/upload" && (method == Method::Put || method == Method::Post) {
@@ -283,6 +302,34 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response, Er
     };
     let actor = claims.sub.clone();
     let ip = "127.0.0.1".to_string();
+
+    // 自助 seed：仅 Admin（重置 admin 密码 / 补建默认车队），兜底首次访问自愈未触发或改密。
+    // body: { "password": "可选，缺省用绑定 VTC_ADMIN_PASSWORD / 内置默认" }
+    if path == "/seed" && method == Method::Post {
+        if let Err(e) = require_admin(&claims) {
+            return err_json(&e);
+        }
+        #[derive(serde::Deserialize, Default)]
+        struct SeedBody {
+            #[serde(default)]
+            password: Option<String>,
+        }
+        let body: SeedBody = req.json().await.unwrap_or_default();
+        let pwd = body
+            .password
+            .or_else(|| match env.secret(ADMIN_PWD_BINDING) {
+                Ok(s) => {
+                    let t = s.to_string();
+                    (!t.is_empty()).then_some(t)
+                }
+                Err(_) => None,
+            })
+            .unwrap_or_else(|| DEFAULT_ADMIN_PWD.into());
+        return match seed_admin(&db, &pwd).await {
+            Ok(msg) => ok_json(&serde_json::json!({ "ok": true, "message": msg })),
+            Err(e) => err_json(&e),
+        };
+    }
 
     // 审计：仅 Admin
     if path == "/audit" && method == Method::Get {
@@ -565,7 +612,7 @@ async fn storage_transit<S: vtc_core::backend::Storage>(
 ) -> Result<Response, Error> {
     match st.local_access(op, key, body).await {
         Ok((b, ct, status)) => {
-            let mut h = Headers::new();
+            let h = Headers::new();
             let _ = h.set("content-type", &ct);
             Ok(Response::builder()
                 .with_status(status)
@@ -634,21 +681,78 @@ fn worker_services(cfg: &WorkerConfig) -> (Arc<vtc_core::auth::JwtService>, Arc<
     )
 }
 
-// ---------- D1 建表（idempotent，P1 在 scheduled/start 事件里调用） ----------
+// ---------- 首次访问自愈：建表 + 种子（幂等，免手动建表 / 免 scheduled） ----------
 
-/// 启动时建表（D1 方言 = SQLite；`db::MIGRATE_SQL` 与 vtc-server/src/db.rs 的 schema 一致）。
-/// P0 无 `start` 事件入口（0.8.6 的 start handler 是同步的，且冷启动路径未接），
-/// 此处保留公开 API 供 P1 的 `scheduled`/`start` 事件调用。
-#[allow(dead_code)]
-pub async fn ensure_schema(d1: &D1Database) -> vtc_core::error::AppResult<()> {
-    d1
-        .exec(db::MIGRATE_SQL)
-        .await
-        .map(|_| ())
-        .map_err(|x| vtc_core::error::AppError::Internal(anyhow::anyhow!("D1 建表失败：{x}")))
+/// 初始化 D1：缺表则跑幂等 `migrate`，缺 admin 则 seed admin + 默认车队。
+/// 判据是「`DB` 绑定是否存在」（调用方已取到 `D1Database`，存在即可建表），
+/// 因此网页端部署后**第一次请求即自动建库**，冷启动约 +0.5s，幂等只跑一次。
+async fn ensure_ready(db: &Arc<db::D1Db>, admin_pwd: &str) -> vtc_core::error::AppResult<()> {
+    db::migrate(db).await?;
+    let need_admin = db.get_user_by_username("admin").await?.is_none();
+    let need_team = db.get_team().await?.is_none();
+    if need_admin || need_team {
+        seed_admin(db, admin_pwd).await?;
+    }
+    Ok(())
 }
 
-#[allow(dead_code)]
-fn _headers() -> Headers {
-    Headers::new()
+/// seed（与 vtc-server `bootstrap::seed` 对齐）：默认车队 + admin 用户 + 对应 member。
+/// 仅当缺失时写，返回说明（已种子 / 已就位）。
+async fn seed_admin(db: &Arc<db::D1Db>, pwd: &str) -> vtc_core::error::AppResult<String> {
+    use vtc_core::constants::role;
+    use vtc_core::domain::{Member, Team, User};
+
+    let mut seeded = Vec::new();
+    if db.get_team().await?.is_none() {
+        let team = Team {
+            id: "default".into(),
+            name: std::env::var("TEAM_NAME").unwrap_or_else(|_| "默认车队".into()),
+            slogan: "松散，自由的行驶、玩耍".into(),
+            slug: "default".into(),
+            logo: "pack://app-assets/brand/logo.png".into(),
+            login_bg: "pack://app-assets/brand/login_bg.jpg".into(),
+            login_layout: "left".into(),
+            accent_color: "#1E88E5".into(),
+            default_lang: "zh-CN".into(),
+            feature_allow_upload: true,
+            feature_tmp_binding: true,
+            feature_rss_enabled: true,
+            created_at: chrono::Utc::now(),
+        };
+        db.upsert_team(&team).await?;
+        seeded.push("默认车队".to_string());
+    }
+    if db.get_user_by_username("admin").await?.is_none() {
+        let admin = User {
+            id: uuid::Uuid::new_v4().to_string(),
+            username: "admin".into(),
+            pass_hash: vtc_core::auth::password::hash_password(pwd),
+            role: role::ADMIN.into(),
+            status: "Active".into(),
+            tmp_player_id: None,
+            steam_id: None,
+            last_login: None,
+            created_at: chrono::Utc::now(),
+        };
+        db.insert_user(&admin).await?;
+        db.insert_member(&Member {
+            id: uuid::Uuid::new_v4().to_string(),
+            user_id: admin.id.clone(),
+            role: role::ADMIN.into(),
+            status: "Active".into(),
+            plate: None,
+            vehicle: None,
+            level: 1,
+            points: 0,
+            joined_at: chrono::Utc::now(),
+            note: Some("初始管理员".into()),
+        })
+        .await?;
+        seeded.push("admin".to_string());
+    }
+    if seeded.is_empty() {
+        Ok("team 与 admin 均已就位，无需 seed".into())
+    } else {
+        Ok(format!("已 seed：{}（admin 初始密码见绑定/默认，请登录后修改）", seeded.join("、")))
+    }
 }

@@ -22,15 +22,16 @@ vtc-rs/
 │  ├─ vtc-server/              # Docker 形态
 │  │   └─ SqliteDb(rusqlite) + LocalStorage + InMemPush + Axum 路由
 │  └─ vtc-worker/              # Cloudflare 形态
-│       └─ D1Db(worker::d1) + R2Storage + DoPush + worker.rs 入口
-│       └─ wrangler.jsonc + migrations/
+│       └─ D1Db(worker::d1) + R2Storage + worker.rs 路由入口
+│       └─ wrangler.jsonc（CI/CD 可选）+ migrations/（手动改 schema 参考）
 ├─ map-dlc/                    # 复用上层模板
 ├─ docker/                     # Dockerfile + docker-compose
 └─ .env.example
 ```
 
-**关键点**：`vtc-core` 的 service 只依赖 `Db`/`Storage`/`Push` 三个 trait（`Arc<dyn ...>`），
-不依赖具体实现。Docker 注入 SQLite/本地/内存，CF 注入 D1/R2/DO，业务逻辑零重写。
+**关键点**：`vtc-core` 的 service **泛型 over `Db`/`Storage` 后端**（持有具体 `Arc<D>`，
+而非 `Arc<dyn Db>`——`?Send` 的 `dyn` 会反向污染 axum 的 Send 边界）。Docker 注入
+SQLite/本地/内存，CF 注入 D1/R2，业务逻辑零重写。
 
 ## 构建
 
@@ -49,13 +50,12 @@ docker compose -f docker/docker-compose.yml up -d
 
 ### Cloudflare Workers 形态
 
-完整步骤（建 D1/R2 → 填 wrangler.jsonc → 上传 DLC 模板到 R2 → 构建 → deploy → 验证）
-见下方 **[Cloudflare Workers 部署](#cloudflare-workers-部署)**。最短路径：
+只需 `cargo build` 出一个 `.wasm`，把它拖进 Cloudflare 控制台即可（**不装 wrangler / 不建 CLI**）。
+完整网页端步骤见下方 **[Cloudflare Workers 部署](#cloudflare-workers-部署)**。
 
 ```bash
-cd crates/vtc-worker
-cargo build --target wasm32-wasip2 --release   # 产物：vtc_worker.wasm（release 约 22 MB）
-wrangler deploy
+cargo build -p vtc-worker --target wasm32-wasip2 --release
+# 产物：target/wasm32-wasip2/release/vtc_worker.wasm（release 约 22 MB）
 ```
 
 ## 与 .NET 版的契约对齐
@@ -89,46 +89,45 @@ service 代码两种 feature 下**完全相同**——这是"一份代码双编�
 
 ## Cloudflare Workers 部署
 
+> **服务端只有两套部署方案**：**① Docker 自部署**（[docker compose](#构建)，下面略）；
+> **② Cloudflare Workers 网页端 Dashboard**（本节，全程在 <https://dash.cloudflare.com> 点选）。
+> 下面就是方案 ② 的全部步骤。
+
 worker 形态**零 C 依赖**（D1/R2 走 CF 托管，无 SQLite、无本地存储），`cargo build` 直接出 wasm，
 不需要 Docker 形态那套预编译 SQLite。**一条代码、一套服务逻辑**，与 Docker 完全共享。
 
-两种部署方式，**选其一**：
+**核心简化——首次访问自愈**：worker 在**每个请求前**自检「D1 建表没有 / admin 有没有」，缺了自动补
+（`src/lib.rs` 的 `ensure_ready`：跑幂等 `db::migrate` 建 13 张表 + seed admin 与默认车队）。
+所以**不手动粘贴 SQL、不配 scheduled cron、不手动建表**：建好 D1/R2、绑名、上传 wasm，
+**第一次访问即自动把库建好并种进 admin**（冷启动约 +0.5s，幂等只跑一次）。
 
-- **[方式 A · 网页端 Dashboard 部署](#方式-a--网页端-dashboard-部署)** —— 全程在 Cloudflare 控制台点选，
-  不装 CLI，适合先快速上线 / 无终端环境。
-- **[方式 B · Wrangler CLI 部署](#方式-b--wrangler-cli-部署)** —— 本地建资源 + 部署，适合 CI/CD 与批量运维。
-
-两者产出的 worker 完全一致；只是「在哪配」不同。
+**唯一要本地做的**：`cargo build` 出一个 `.wasm`，拖进控制台。
 
 ---
 
-### 方式 A · 网页端 Dashboard 部署
+### 网页端 Dashboard 部署（方案 ②）
 
-> 全程在 <https://dash.cloudflare.com> 操作，**不用装 wrangler / Node**。
-> 唯一需要本地做的，是 `cargo build` 出一个 `.wasm` 文件，然后把它拖进控制台。
+> 全程在 <https://dash.cloudflare.com> 操作，**不用装 wrangler / Node / Rust 以外的工具**。
 
 **前提**：已 `cargo build -p vtc-worker --target wasm32-wasip2 --release`，得到
-`target/wasm32-wasip2/release/vtc_worker.wasm`（约 22 MB）。把它改名或记住路径，下面要上传。
+`target/wasm32-wasip2/release/vtc_worker.wasm`（约 22 MB），下面要上传。
 
-#### A1. 建 D1 数据库（网页端）
+#### ① 建 D1 数据库（网页端，**只建空库，不跑 SQL**）
 
 1. 控制台左侧 **Workers & Pages → D1 数据库**（或顶部搜「D1」）。
 2. 点 **Create a database**（创建数据库），选区域，起个名字（如 `vtc`）。
-3. 创建后进入该库，左侧 **SQL**（或 **Schema**）页签 —— 把
-   [`crates/vtc-worker/migrations/0001_init.sql`](crates/vtc-worker/migrations/0001_init.sql)
-   的**全部内容**粘贴进 SQL 编辑器，点 **Save / Run**，13 张表 + 索引即建成。
-   > 网页端没有「应用 migrations」按钮，所以建表走 SQL 编辑器手动跑一次。
-   > 之后每次改 schema，都在这个 SQL 页追加 `CREATE TABLE / ALTER` 语句重跑即可（语句都带 `IF NOT EXISTS`，幂等）。
-4. 记住这个 D1 库的**名字**（`vtc`）——A4 绑定 D1 时选它。
+3. 记住这个 D1 库的**名字**（`vtc`）——后面「配置 Worker」绑定 D1 时选它。
+   > **不需要**进 SQL 编辑器跑建表语句：worker 首次访问会自动建全部 13 张表（见「首次访问自愈」）。
+   > 若你之后要手动改 schema，再进 **SQL** 页追加 `CREATE / ALTER`（都带 `IF NOT EXISTS`，幂等）。
 
-#### A2. 建 R2 存储桶（网页端）
+#### ② 建 R2 存储桶（网页端）
 
 1. 控制台左侧 **Workers & Pages → R2 对象存储**（或搜「R2」）。
 2. 点 **Create a bucket**，命名（如 `vtc-saves`），选区域。
-3. 记下桶名（`vtc-saves`）——A4 绑定 R2 时选它。
-4. （可暂缓）DLC 模板稍后从 A6 上传，先建空桶也行。
+3. 记下桶名（`vtc-saves`）——后面「配置 Worker」绑定 R2 时选它。
+4. （可暂缓）存档与 DLC 模板都放这个桶；先建空桶也行，DLC 模板稍后从「④ 配路由」前的 ③ 步补传。
 
-#### A3. 创建 Worker 并上传 wasm（网页端）
+#### ③ 创建 Worker 并上传 wasm（网页端）
 
 1. 控制台左侧 **Workers & Pages → 创建 Worker**（Create Worker）。
 2. **关键：选「上传代码 / Upload」而不是「创建 Worker（粘贴 JS）」**——
@@ -145,10 +144,8 @@ worker 形态**零 C 依赖**（D1/R2 走 CF 托管，无 SQLite、无本地存�
 
 1. **Observability → Logs**：按需开（可选，便于排查）。
 2. **Settings → Bindings**（资源绑定）：
-   - **Add D1 database** → 绑定名填 **`DB`**，选 A1 建的 D1 库（`vtc`）。
-   - **Add R2 bucket** → 绑定名填 **`BUCKET`**，选 A2 建的 R2 桶（`vtc-saves`）。
-   - （可选）**Durable Object**：绑定名 `PUSH`、class `PushRoom` —— P0 用内存存根，
-     不绑定也能跑；P1 接 WebSocket 推送时再加。
+   - **Add D1 database** → 绑定名填 **`DB`**，选 ① 建的 D1 库（`vtc`）。
+   - **Add R2 bucket** → 绑定名填 **`BUCKET`**，选 ② 建的 R2 桶（`vtc-saves`）。
    > ⚠ 绑定名必须**精确**是 `DB` 和 `BUCKET`（全大写），代码 `src/lib.rs` 里按这两个名字取
    > `env.d1("DB")` / `env.get_binding("BUCKET")`，名字对不上会运行时报「binding 未找到」。
 3. **Settings → Variables and Secrets**（环境变量与密钥）：
@@ -156,7 +153,9 @@ worker 形态**零 C 依赖**（D1/R2 走 CF 托管，无 SQLite、无本地存�
      `TEAM_NAME`=默认车队、`UPDATE_CHANNEL`=stable、`PUBLIC_BASE`=你的正式域名
      （如 `https://vtc.example.com`）、`AUTH_REQUIRE_TMP`=false、`AUTH_REQUIRE_STEAM`=false。
    - **Secrets**（机密，网页端用 **Add secret** 而不是写进 variables）：
-     `JWT_SECRET`（**生产必须 ≥32 字符**）、`VTC_STORAGE_SIGN_KEY`（存储中转 HMAC 密钥）。
+     `JWT_SECRET`（**生产必须 ≥32 字符**）、`VTC_STORAGE_SIGN_KEY`（存储中转 HMAC 密钥）、
+     `VTC_ADMIN_PASSWORD`（seed 出的 admin 初始密码，**强烈建议设一个随机强口令**；
+     不设则用内置默认 `ChangeMe123!`）。
    > 网页端没有 `wrangler secret put`，对应用 **Variables and Secrets → Add secret** 弹窗填值。
 4. **Settings → Compatibility**（兼容性）：
    - **Compatibility Date** 选 **`2025-08-01`**（与 `wrangler.jsonc` 一致）。
@@ -164,7 +163,7 @@ worker 形态**零 C 依赖**（D1/R2 走 CF 托管，无 SQLite、无本地存�
      > 这是 worker-rs 上传 wasm 的**硬性要求**：wasm 内的 `wasm-bindgen` 胶水依赖 Node.js
      > 兼容层才能跑。不勾这个 flag，worker 会启动即报错。
 
-#### A5. 配路由 / 域名（网页端 Routing）
+#### ⑤ 配路由 / 域名（网页端 Routing）
 
 还是这个 worker 的 **Settings → Routing**（或「Rules / 域名」页）：
 
@@ -173,13 +172,13 @@ worker 形态**零 C 依赖**（D1/R2 走 CF 托管，无 SQLite、无本地存�
    加两条路由 `/api/*` 与 `/storage/*`（worker 同时服务这两类路径，见 `src/lib.rs`）。
    > 若整站都走 worker（含根路径），可把路由设成 `vtc.example.com/*`。
 
-#### A6. 上传 DLC 模板到 R2（网页端）
+#### ⑥ 上传 DLC 模板到 R2（网页端，**可选，不影响核心 API**）
 
-worker 无文件系统，DLC 地图模板改存 **R2 的 `dlc-templates/` 前缀**
-（`/dlc/map-template` 与 `/dlc/disable` 从这里读）：
+worker 无文件系统，DLC 地图模板存 **R2 的 `dlc-templates/` 前缀**
+（`/dlc/map-template` 与 `/dlc/disable` 从这里读）。**不传也能部署**，只是这两个 DLC 端点返回「模板缺失」：
 
-1. 控制台进入 A2 建的 R2 桶 → **文件 / Files**。
-2. **上传**两个文件，并把 R2 里的「路径/前缀」写成 `dlc-templates/`：
+1. 控制台进入 ② 建的 R2 桶 → **文件 / Files**。
+2. **上传**两个文件，确保 R2 里的最终 key 是：
    - `dlc-templates/1.61.ets2.txt`（内容来自上层 `map-dlc/1.61.ets2.txt`，10 条）
    - `dlc-templates/1.61.ats.txt`（内容来自上层 `map-dlc/1.61.ats.txt`，20 条）
    > R2 网页上传会把本地文件名映射成对象 key；把本地文件先**重命名**成
@@ -188,96 +187,34 @@ worker 无文件系统，DLC 地图模板改存 **R2 的 `dlc-templates/` 前缀
 3. 加新游戏版本：把对应 `map-dlc/<major>.<game>.txt` 按同样 key 传到 `dlc-templates/`，
    无需改 worker 代码。
 
-#### A7. 验证（网页端）
+#### ⑦ 验证（网页端，**触发首次访问自愈**）
 
 - 打开 `https://vtc-server.<子域>.workers.dev/api/v1/health` 应返回 `ok`。
-- `/api/v1/config/public` 返回车队品牌（无鉴权）。
+  **就是这一下**触发了 `ensure_ready`：自动建 13 张表 + 种入 admin / 默认车队（第一次约慢 0.5s）。
+- `/api/v1/config/public` 返回车队品牌（无鉴权，此时 team 已被 seed）。
 - 控制台左侧 **Workers → vtc-server → Logs** 可看实时请求日志；
   **Workers → Observability** 看 CPU/内存曲线。
 - 完整冒烟（登录 / 成员 CRUD / 存档 / DLC / 审计）见下方 [验证](#验证部署后)。
 
-> **首次部署后 admin 登录**：seed 的 admin 账号密码是 `admin` / `ChangeMe123!`，
-> 在 D1 里改（或 P1 加管理界面后改）。`JWT_SECRET` 忘配也能登录（worker 用内置开发默认值并打警告），
-> 但**生产必须配**。
-
----
-
-### 方式 B · Wrangler CLI 部署
-
-> 本地建资源 + 部署，适合 CI/CD、批量运维、或想把配置写进 `wrangler.jsonc` 版本化的场景。
-> `crates/vtc-worker/wrangler.jsonc` 已写好 binding/vars/路由模板，下面主要把占位符填实。
-
-#### B1. 前置：本地资源（一次性）
-
-在 `crates/vtc-worker/` 下执行（需 `wrangler`，`npm i -g wrangler` 或 `npm i -g wrangler@3`）：
-
-```bash
-cd crates/vtc-worker
-
-# 1) 创建 D1（= SQLite 方言的关系型数据库；返回 database_id）
-wrangler d1 create vtc
-#    → 把返回的 database_id 填进 wrangler.jsonc 的 bindings[DB].database_id
-
-# 2) 创建 R2 桶（对象存储：存档 + DLC 模板都放这）
-wrangler r2 bucket create vtc-saves
-
-# 3) 应用 D1 建表迁移（13 张表；等价于网页端的 A1「SQL 编辑器粘贴 0001_init.sql」）
-wrangler d1 migrations apply DB
-```
-
-#### B2. 填 wrangler.jsonc
-
-- `bindings[DB].database_id`：上一步 `wrangler d1 create` 的值。
-- `bindings[BUCKET].bucket_name`：R2 桶名（`vtc-saves`）。
-- `routes[].zone_id`：你的 Cloudflare zone id（`wrangler whoami` 可查）；自定义域名场景填
-  `/api/*` 与 `/storage/*` 两条路由（worker 同时服务两类路径，见 `src/lib.rs` 路由分发）。
-- `vars`：非机密配置（`TEAM_NAME` / `UPDATE_CHANNEL` / `PUBLIC_BASE` / `AUTH_REQUIRE_TMP` …）。
-  **`JWT_SECRET` 不写 vars**，用 secret：
-
-```bash
-wrangler secret put JWT_SECRET          # 生产必须 ≥32 字符
-wrangler secret put VTC_STORAGE_SIGN_KEY # 存储中转 HMAC 签名密钥
-```
-
-> `wrangler.jsonc` 的 `compatibility_flags: ["nodejs_compat"]` 与 `compatibility_date` 已配好，
-> 对应网页端的 A4「Compatibility」，CLI 下不用手动勾。
-
-#### B3. 上传 DLC 模板到 R2
-
-worker 无文件系统，DLC 地图模板（`map-dlc/1.61.ets2.txt` 等）改存 **R2 的 `dlc-templates/` 前缀**
-（`/dlc/map-template` 与 `/dlc/disable` 从这里读）。把上层 `map-dlc/` 的模板文件批量上传：
-
-```bash
-# ETS2 1.61（10 条）
-wrangler r2 object put dlc-templates/1.61.ets2.txt --file <上层>/map-dlc/1.61.ets2.txt
-# ATS 1.61（20 条）
-wrangler r2 object put dlc-templates/1.61.ats.txt  --file <上层>/map-dlc/1.61.ats.txt
-```
-
-> 客户端按 `<major>.<game>.txt` 取模板；加新游戏版本时把对应模板 `put` 到 `dlc-templates/` 即可，
-> 无需改 worker 代码。
-
-#### B4. 构建 + 部署
-
-```bash
-cd crates/vtc-worker
-# 产物：target/wasm32-wasip2/release/vtc_worker.wasm（release 约 22 MB，CF 限额内）
-cargo build --target wasm32-wasip2 --release
-wrangler deploy
-#    → https://vtc-server.<你的子域>.workers.dev
-```
+> **admin 登录**：seed 的账号是 `admin`，密码 = 你配的 `VTC_ADMIN_PASSWORD` secret；
+> 没配就是内置默认 `ChangeMe123!`。**登录后建议立即改密**，或用管理员自助端点
+> `POST /api/v1/seed`（body `{"password":"新密码"}`，需 admin Bearer）随时重置。
+> `JWT_SECRET` 忘配也能登录（worker 用内置开发默认值并打警告），但**生产必须配**。
 
 ### 验证（部署后）
 
 ```bash
 B=<你的 workers.dev 域名>
-curl $B/api/v1/health                        # ok
+curl $B/api/v1/health                        # ok（第一次会触发建表 + seed，约慢 0.5s）
 curl $B/api/v1/config/public                 # 车队品牌（无鉴权）
-curl $B/api/v1/dlc/map-template?game=ets2&major=1.61   # R2 模板（10 条）
-# 登录拿 token（admin / ChangeMe123!，可用 wrangler secret put 改 ADMIN_INITIAL_PASSWORD）
+curl $B/api/v1/dlc/map-template?game=ets2&major=1.61   # R2 模板（10 条；未传则提示缺失）
+# 登录拿 token（admin / 你配的 VTC_ADMIN_PASSWORD，未配则 ChangeMe123!）
 curl -X POST $B/api/v1/auth/login -H 'content-type: application/json' \
      -d '{"username":"admin","password":"ChangeMe123!"}'
-# 带 Bearer 调管理端点（/members /saves /audit …）
+# 带 Bearer 调管理端点（/members /saves /audit /seed …）
+# 重置 admin 密码（仅 admin）：
+curl -X POST $B/api/v1/seed -H "authorization: Bearer <TOKEN>" \
+     -H 'content-type: application/json' -d '{"password":"新强口令"}'
 ```
 
 ### 形态对照（同一份 service，两种后端）
@@ -286,11 +223,12 @@ curl -X POST $B/api/v1/auth/login -H 'content-type: application/json' \
 |---|---|---|
 | 数据库 | SQLite（`rusqlite`，本地文件 `vtc.db`） | **D1**（CF 托管，`db::D1Db` 实现 `Db`） |
 | 对象存储 | 本地磁盘（`LocalStorage`） | **R2**（`R2Storage`；预签名 URL → worker 中转 HMAC 签名） |
-| DLC 模板 | 本地 `map-dlc/*.txt` 文件 | **R2 `dlc-templates/*.txt`**（`parse_template` 解析） |
-| 推送 | 内存 `InMemPush`（存根） | Durable Objects 骨架（存根） |
+| DLC 模板 | 本地 `map-dlc/*.txt` 文件 | **R2 `dlc-templates/*.txt`**（`parse_template` 解析，可后传） |
+| 建表/种子 | 启动时 `bootstrap::seed`（SQLite 自动迁移） | **首次访问自愈** `ensure_ready`（自动建表 + seed，免手动） |
+| 推送 | 内存 `InMemPush`（存根） | P1 接 Durable Objects（P0 内存占位） |
 | 路由 | Axum（`{id}` 模板） | `match (path, method)` 段解析（无 axum） |
 | async | `#[async_trait]`（Send） | `#[async_trait(?Send)]`（wasm 单线程） |
-| 部署 | `docker compose up` | `wrangler deploy` |
+| 部署 | `docker compose up` | **Cloudflare 网页端 Dashboard**（拖 .wasm + 绑 D1/R2 + 勾 `nodejs_compat`） |
 
 ## 状态
 
@@ -298,9 +236,7 @@ curl -X POST $B/api/v1/auth/login -H 'content-type: application/json' \
   saves 上传凭证+发布+下载凭证+取消+删除/announcements CRUD/events CRUD/dlc map-template+required+
   report+disable+restore/audit 列表+过滤/存储中转 PUT+GET/401 鉴权边界）。
 - **Cloudflare Workers 形态**：编译绿（`vtc_worker.wasm` 22 MB），P0 全量路由与 Docker 同源
-  （共享 vtc-core service），D1/R2 模板源就位。部署两条路：**网页端 Dashboard**（全程点选，
-  拖入 .wasm + 绑 D1/R2 + 勾 `nodejs_compat`）或 **Wrangler CLI**（`wrangler deploy`），见上方
-  [Cloudflare Workers 部署](#cloudflare-workers-部署)。
-- **遗留（P1）**：WebSocket 真实推送（Durable Objects）、S3/PostgreSQL 后端、D1 建表的
-  `start`/`scheduled` 事件接入（P0 网页端在 D1 的 SQL 编辑器手动跑 `0001_init.sql`，
-  CLI 用 `wrangler d1 migrations apply`）。
+  （共享 vtc-core service）。部署走 **Cloudflare 网页端 Dashboard**（全程点选：拖入 .wasm +
+  绑 D1/R2 + 勾 `nodejs_compat`），见上方 [Cloudflare Workers 部署](#cloudflare-workers-部署)。
+  **首次访问自愈**：worker 第一次请求自动建 13 张表并 seed admin / 默认车队，免手动建表与 cron。
+- **遗留（P1）**：WebSocket 真实推送（Durable Objects）、S3/PostgreSQL 后端。

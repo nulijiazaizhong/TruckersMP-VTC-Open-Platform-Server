@@ -1,0 +1,14 @@
+err_worker 替代 err：D1 错误用 cause() 安全串，不 Debug js_sys::Error
+
+真根因（反查 __wbg_new = new Error）：D1 操作失败时 .map_err(err) 调
+worker::Error 的 Display，其对 D1 变体是 write!(f, "D1: {e:#?}")，
+即 D1Error 的 Debug 展开整个 inner:js_sys::Error（含 JsValue）。
+wasm 下 Debug 含 JsValue 的类型触发 JS 调用（Reflect/stringify），
+边界抛异常 -> new Error(__wbg_new) Critical。
+login 崩 = get_user_by_username 某 D1 操作 Err；
+config/public 成功 = 那次 D1 无 Err 不调 err()。
+修复：新增 err_worker，9 处 D1 的 map_err(err) 全改 err_worker；
+D1 变体用 D1Error::cause()（安全字符串，D1 真实错误），
+其余变体 match 固定串，绝不 Debug/Display 内部 JsValue。
+fetch 永不返回 Err 的 wrapper 保留。
+vtc-worker wasm 编译过。测 login 应返回 500 JSON 带 D1 真实错误。

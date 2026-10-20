@@ -38,8 +38,54 @@ fn dt_opt<T: AsRef<str>>(s: T) -> Option<DateTime<Utc>> {
     str_to_dt(s.as_ref()).ok()
 }
 
+#[allow(dead_code)] // 通用 Display 转换；D1 路径已改用 err_worker（避免 D1Error Debug 触发 JS）
 fn err(e: impl std::fmt::Display) -> AppError {
     AppError::Internal(anyhow::anyhow!("{e}"))
+}
+
+/// ★ 安全转换 `worker::Error` → `AppError`：**不**调 `worker::Error` 的 `Display`。
+/// `worker::Error::D1(D1Error)` 的 `Display` 是 `write!(f, "D1: {e:#?}")`，
+/// `{e:#?}` 是 `D1Error` 的 `Debug`，其内部持有 D1 原始 `JsValue` 错误对象；
+/// 在 wasm 下 `Debug` 一个含 `JsValue` 的类型会触发 JS 调用（Reflect/stringify），
+/// 边界抛异常 → `__wbg_new`（`new Error`）Critical（CF 日志反复定位的崩溃）。
+/// 故这里 `match` 已知变体、其余兜底固定串，**绝不** `Debug`/`Display` 内部 JsValue。
+fn err_worker(e: worker::Error) -> AppError {
+    let msg = match &e {
+        // ★ 用 D1Error::cause()（安全字符串：D1 真实错误如 "no such column"/"SQLITE_BUSY"），
+        // 不用 worker::Error 的 Display（其对 D1 走 {e:#?} Debug 展开整个 js_sys::Error，
+        // 含 JsValue → wasm 边界 JS 异常 → __wbg_new Critical）。
+        worker::Error::D1(d) => format!("D1：{}", d.cause()),
+        worker::Error::Json((m, _)) => m.clone(),
+        worker::Error::JsError(m) => m.clone(),
+        worker::Error::BindingError(n) => format!("缺少绑定 {n}"),
+        worker::Error::BodyUsed => "请求体已读取".to_string(),
+        worker::Error::BadEncoding => "编码错误".to_string(),
+        worker::Error::SerdeWasmBindgenError(_) => "serde 序列化错误".to_string(),
+        worker::Error::SerdeJsonError(_) => "JSON 错误".to_string(),
+        other => format!("worker 错误（变体：{:?}", variant_name(other)),
+    };
+    AppError::Internal(anyhow::anyhow!("{msg}"))
+}
+
+/// 只取 `worker::Error` 的变体名（不展开内部），用于诊断。
+fn variant_name(e: &worker::Error) -> &'static str {
+    // 用 std::fmt 的 Debug 会展开内部 JsValue（触发 JS），故手工 match 变体名。
+    // `worker::Error` 是 #[non_exhaustive]，用通配兜底。
+    match e {
+        worker::Error::D1(_) => "D1",
+        worker::Error::Json(_) => "Json",
+        worker::Error::JsError(_) => "JsError",
+        worker::Error::Internal(_) => "Internal",
+        worker::Error::BindingError(_) => "BindingError",
+        worker::Error::BodyUsed => "BodyUsed",
+        worker::Error::BadEncoding => "BadEncoding",
+        worker::Error::Infallible => "Infallible",
+        worker::Error::Io(_) => "Io",
+        worker::Error::RustError(_) => "RustError",
+        worker::Error::SerdeJsonError(_) => "SerdeJsonError",
+        worker::Error::SerdeWasmBindgenError(_) => "SerdeWasmBindgenError",
+        _ => "Other",
+    }
 }
 
 // ---------- 参数槽（类型化，避免借用 self） ----------
@@ -124,8 +170,8 @@ fn to_js(args: &[Arg]) -> Vec<JsValue> {
 // ---------- 查询辅助 ----------
 
 async fn exec(db: &D1Database, sql: &str, args: Vec<Arg>) -> AppResult<()> {
-    let st = db.prepare(sql).bind(&to_js(&args)).map_err(err)?;
-    st.run().await.map_err(err)?;
+    let st = db.prepare(sql).bind(&to_js(&args)).map_err(err_worker)?;
+    st.run().await.map_err(err_worker)?;
     Ok(())
 }
 
@@ -141,8 +187,8 @@ async fn exec(db: &D1Database, sql: &str, args: Vec<Arg>) -> AppResult<()> {
 /// 并手动展开每行。
 async fn raw_rows(db: &D1Database, sql: &str, args: Vec<Arg>, _cols: usize) -> AppResult<Vec<Vec<JsValue>>> {
     use wasm_bindgen::JsCast;
-    let st = db.prepare(sql).bind(&to_js(&args)).map_err(err)?;
-    let rows = st.raw_js_value().await.map_err(err)?;
+    let st = db.prepare(sql).bind(&to_js(&args)).map_err(err_worker)?;
+    let rows = st.raw_js_value().await.map_err(err_worker)?;
     let mut out = Vec::with_capacity(rows.len());
     for row_js in rows {
         // 每行是一个 js_sys::Array（[cell0, cell1, ...]）。展开成 Vec<JsValue>。
@@ -169,8 +215,8 @@ fn js_to_i64(v: &JsValue) -> Option<i64> {
 
 /// COUNT(*) 取单个标量（1 列 × 1 行）
 async fn count_row(db: &D1Database, sql: &str, args: Vec<Arg>) -> AppResult<i64> {
-    let st = db.prepare(sql).bind(&to_js(&args)).map_err(err)?;
-    let v = st.raw_js_value().await.map_err(err)?;
+    let st = db.prepare(sql).bind(&to_js(&args)).map_err(err_worker)?;
+    let v = st.raw_js_value().await.map_err(err_worker)?;
     Ok(v.first().and_then(js_to_i64).unwrap_or(0))
 }
 
@@ -348,8 +394,8 @@ impl vtc_core::backend::Db for D1Db {
         // first::<serde_json::Value>(None)：走 serde_wasm_bindgen 反序列化成**对象**
         // {col:val}（非数组），单行查询最干净，完全绕开 raw_js_value 的数组展开。
         let sql = "SELECT id,username,pass_hash,role,status,tmp_player_id,steam_id,last_login,created_at FROM \"user\" WHERE username=?";
-        let st = self.0.prepare(sql).bind(&to_js(&[Arg::Text(username.into())])).map_err(err)?;
-        let obj: Option<serde_json::Value> = st.first::<serde_json::Value>(None).await.map_err(err)?;
+        let st = self.0.prepare(sql).bind(&to_js(&[Arg::Text(username.into())])).map_err(err_worker)?;
+        let obj: Option<serde_json::Value> = st.first::<serde_json::Value>(None).await.map_err(err_worker)?;
         Ok(obj.map(user_from_value))
     }
 
@@ -796,6 +842,6 @@ pub async fn migrate(db: &D1Database) -> AppResult<()> {
         .filter(|s| !s.is_empty())
         .map(|s| db.prepare(s.to_string()))
         .collect();
-    db.batch(statements).await.map_err(err)?;
+    db.batch(statements).await.map_err(err_worker)?;
     Ok(())
 }

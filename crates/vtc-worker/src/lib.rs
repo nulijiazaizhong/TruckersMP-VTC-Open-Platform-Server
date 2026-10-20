@@ -44,7 +44,7 @@ use vtc_core::service::{
     SaveService,
 };
 // worker 0.8.6 顶层 re-export（d1 模块需 feature="d1"）
-use worker::{console_log, Bucket, Context, D1Database, Env, Error, Headers, Method, Request, Response};
+use worker::{Bucket, Context, D1Database, Env, Error, Headers, Method, Request, Response};
 
 // 绑定名（与 wrangler.jsonc 的 bindings 对应）
 const D1_BINDING: &str = "DB";
@@ -215,24 +215,14 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response, Er
             };
         }
         ("/auth/login", Method::Post) => {
-            // ★ 用 req.text() + serde_json::from_str（不用 req.json()）：req.json() 内部走
-            // serde_wasm_bindgen::from_value，在 wasm 下对非对象 JsValue 可能 panic
-            // （outcome:exception，CF 1101）。text() 只取字符串，from_str 错误走 Err 不 panic。
-            // ★ console.log 标记（诊断 panic 区间）：console_error_panic_hook 把 panic 打到
-            // CF console 日志；这些 log 显示「最后走到哪步」→ panic 就在下一步。定位后可删。
-            console_log!("VTC login: enter, path={path}");
-            let body: dto::auth::AuthLoginDto =
-                match req.text().await {
-                    Ok(t) => {
-                        console_log!("VTC login: text() ok, len={}", t.len());
-                        serde_json::from_str(&t).unwrap_or_default()
-                    }
-                    Err(e) => {
-                        console_log!("VTC login: text() ERR: {e}");
-                        dto::auth::AuthLoginDto::default()
-                    }
-                };
-            console_log!("VTC login: parsed body, username={}", body.username);
+            // ★ req.text() + serde_json::from_str（不用 req.json() 的 from_value）。
+            // ★ **不**用 console_log 做诊断：CF worker 的 console（web_sys::console）在
+            // wasm 单线程热路径**连续**同步调用会**挂起**（CF 判定 hang 取消请求，
+            // "Worker's code had hung"）——前两条侥幸过、第三条卡死。诊断改走 response。
+            let body: dto::auth::AuthLoginDto = match req.text().await {
+                Ok(t) => serde_json::from_str(&t).unwrap_or_default(),
+                Err(_) => dto::auth::AuthLoginDto::default(),
+            };
             let auth = AuthService::new(
                 db.clone(),
                 jwt.clone(),
@@ -240,16 +230,9 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response, Er
                 cfg.require_tmp,
                 cfg.require_steam,
             );
-            console_log!("VTC login: calling auth.login()");
             return match auth.login(&body, "127.0.0.1").await {
-                Ok(v) => {
-                    console_log!("VTC login: SUCCESS user={}", v.user.username);
-                    ok_json(&v)
-                }
-                Err(e) => {
-                    console_log!("VTC login: ERR {e}");
-                    err_json(&e)
-                }
+                Ok(v) => ok_json(&v),
+                Err(e) => err_json(&e),
             };
         }
         ("/auth/refresh", Method::Post) => {

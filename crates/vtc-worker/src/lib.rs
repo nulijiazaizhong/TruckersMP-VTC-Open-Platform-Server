@@ -176,9 +176,12 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response, Er
         Ok(s) => s.to_string(),
         Err(_) => String::new(),
     };
-    if ensure_ready(&db, &pwd).await.is_err() {
+    // ★ 捕获 ensure_ready 的**具体**错误并返回（不再 .is_err() 吞掉）：
+    //   首次访问建表/seed 失败时（D1 不存在 / SQL 错 / 权限），把真实错误带进 response，
+    //   便于线上诊断（否则只回固定「D1 初始化失败」，看不到 D1 到底报什么）。
+    if let Err(e) = ensure_ready(&db, &pwd).await {
         return err_json(&AppError::Internal(anyhow::anyhow!(
-            "D1 初始化失败（建表/种子），请确认 `DB` 绑定指向可用 D1"
+            "D1 初始化失败（建表/种子）：{e}；请确认 `DB` 绑定指向可用 D1"
         )));
     }
     let (jwt, rate) = worker_services(&cfg);

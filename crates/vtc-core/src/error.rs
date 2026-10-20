@@ -57,12 +57,18 @@ impl AppError {
         }
     }
 
-    /// 统一错误响应体（camelCase，对齐 VTC.Shared.ApiError）
+    /// 统一错误响应体（camelCase，对齐 VTC.Shared.ApiError）。
+    /// `Internal` 的 anyhow 详情放进 `details`（其余错误保持 details=null），
+    /// 便于线上诊断（如 D1 建表/seed 失败时看到真实错误）。
     pub fn to_json(&self) -> serde_json::Value {
+        let details = match self {
+            AppError::Internal(e) => serde_json::Value::String(e.to_string()),
+            _ => serde_json::Value::Null,
+        };
         serde_json::json!({
             "code": self.biz_code(),
             "message": self.to_string(),
-            "details": serde_json::Value::Null,
+            "details": details,
         })
     }
 }

@@ -65,11 +65,23 @@ cargo build -p vtc-server --release
 全程网页点选，**不用装 wrangler / Rust / Node**（Rust 工具链由 Cloudflare 构建时自动装）。
 最短路径见下方 **[Cloudflare Workers 部署（连 GitHub 仓库）](#cloudflare-workers-部署)**。
 
-> 本地构建（仅调试 / 手动上传时用）：
+> 本地构建（仅调试 / 手动上传时用，**与 `cf-build.sh` 完全一致**）：
 > ```bash
-> cargo build -p vtc-worker --target wasm32-wasip2 --release
-> # 产物：target/wasm32-wasip2/release/vtc_worker.wasm（release 约 59 KB，已开 lto/strip）
+> rustup target add wasm32-unknown-unknown
+> cargo build -p vtc-worker --target wasm32-unknown-unknown --release
+> # wasm-bindgen 生成 worker 入口（--target module，自实例化）：
+> wasm-bindgen target/wasm32-unknown-unknown/release/vtc_worker.wasm \
+>   --out-dir crates/vtc-worker/dist --no-typescript --target module --out-name index
+> # worker.js 顶层： import {fetch} from './index.js'; export default {fetch};
 > ```
+> ⚠ 目标必须是 **`wasm32-unknown-unknown`**（worker-rs 0.8.6 的 wasm-bindgen web 栈），
+> **不是** `wasm32-wasip2`。wrangler 用 **v4**。
+>
+> **时钟依赖（login 曾 1101 的根因，务必保留）**：workspace `chrono` 必须带 **`wasmbind`**
+> 特性，且 `rate.rs` 只能走 `chrono::Utc::now()`，**不能**碰 `std::time::{Instant,SystemTime}`
+> ——后者在 `wasm32-unknown-unknown` 上直接 panic「time not implemented on this platform」
+> → CF `__wbg_new` Critical（"Worker's code had hung" / 1101）。Docker 侧不受影响（`wasmbind`
+> 内部 `#[cfg(wasm32)]` 门控）。
 
 ## 与 .NET 版的契约对齐
 
@@ -146,7 +158,7 @@ worker 形态**零 C 依赖**（D1/R2 走 CF 托管，无 SQLite、无本地存�
 | **项目名称** | `vtc-server` | CF 默认填仓库 slug，建议改成和 worker 名一致（非必须）。 |
 | **构建命令** | 见下方「构建命令」整段 | CF 镜像无 Rust，**必须**现场装 rustup + wasm target，再跑仓库脚本。 |
 | **部署命令** | 见下方「部署命令」整段 | 装 wrangler、把配置拷进产物目录再 `wrangler deploy`。 |
-| **预览命令** | `npm i -g wrangler@3 && cd crates/vtc-worker/dist && wrangler preview` | **必填字段**（CF 表单不允许空）。它只用于本地调试，**不影响正式部署**（部署走上面的「部署命令」）。worker-rs 本地预览可能因 `nodejs_compat` 模拟不完美而报错，**报错了也不影响 `wrangler deploy` 上线**，可忽略。 |
+| **预览命令** | `npm i -g wrangler@4 && cd crates/vtc-worker/dist && wrangler preview` | **必填字段**（CF 表单不允许空）。它只用于本地调试，**不影响正式部署**（部署走上面的「部署命令」）。worker-rs 本地预览可能因 `nodejs_compat` 模拟不完美而报错，**报错了也不影响 `wrangler deploy` 上线**，可忽略。 |
 | **启用预览构建** | **关** | 不需要 CI 跑预览。 |
 | **使用 Cloudflare Access 保护** | **关** | API 服务不用，需要时再开。 |
 | **高级设置** | 默认即可 | 展开可设 Rust 版本等，不填也行。 |
@@ -159,7 +171,7 @@ worker 形态**零 C 依赖**（D1/R2 走 CF 托管，无 SQLite、无本地存�
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
   && export PATH="$HOME/.cargo/bin:$PATH" \
-  && rustup target add wasm32-wasip2 \
+  && rustup target add wasm32-unknown-unknown \
   && bash crates/vtc-worker/cf-build.sh
 ```
 
@@ -171,7 +183,7 @@ routes，`main: index.js` 让 wrangler 把 `index.js` + `vtc_worker.wasm` 一起
 `--remote-config` 从 Cloudflare 拉回该 worker 已保存的 `DB`/`BUCKET` 绑定、secrets、正式域名路由，
 覆盖本地配置，占位符免填。）
 ```bash
-npm i -g wrangler@3 \
+npm i -g wrangler@4 \
   && cd crates/vtc-worker/dist \
   && wrangler deploy --remote-config
 ```
@@ -216,9 +228,10 @@ npm i -g wrangler@3 \
 
 ### 附：手动上传 wasm（不连仓库）
 
-> 一次性部署、不想连 GitHub 仓库时用。本地 `cargo build -p vtc-worker --target wasm32-wasip2 --release`
-> 出 `vtc_worker.wasm`，在控制台 **创建 Worker → 上传代码**，**`vtc_worker.wasm` 和 `index.js`
-> （仓库 [`crates/vtc-worker/index.js`](crates/vtc-worker/index.js)）两个一起传**，再按上面第 3 步配
+> 一次性部署、不想连 GitHub 仓库时用。本地跑 `bash crates/vtc-worker/cf-build.sh`
+> （= `cargo build -p vtc-worker --target wasm32-unknown-unknown --release` + `wasm-bindgen --target module`），
+> 在控制台 **创建 Worker → 上传代码**，把 `dist/` 里的 **`worker.js` + `index.js` + `index_bg.wasm`**
+> 一起传（`worker.js` 是 `export default {fetch}` 入口），再按上面第 3 步配
 > 绑定 / 密钥 / `nodejs_compat`。
 > ⚠ 只传 `.wasm` 不传 `index.js` 会被 CF 当成「静态 Worker」，报「不能将绑定添加到只有静态资产的 Worker」，
 > 绑不上 D1/R2——`index.js` 让 CF 认出这是「代码 Worker」，绑定才解锁。

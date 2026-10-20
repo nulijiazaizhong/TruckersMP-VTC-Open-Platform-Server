@@ -244,31 +244,17 @@ async fn fetch_inner(mut req: Request, env: Env, _ctx: Context) -> Result<Respon
             };
         }
         ("/auth/login", Method::Post) => {
-            // ★ v6 分段（rate 已修 Mutex+SystemTime）：db读→status→**密码**→停，带 stage。
-            // 完整 auth.login 仍崩（cpu 35ms 早崩）→ 定位 db读 之后哪一步。
-            // 过密码后下一轮推进 JWT / D1 写。
+            // ★ v7：rate 已根治（`Mutex`→`RefCell`；无 multi-thread 的 wasm 下
+            //   `Mutex::lock()` 走平台锁/线程启动 → worker 立即 abort，即 v6 的
+            //   1101）。跑**完整** `auth.login`（rate→db→status→PBKDF2→JWT→D1 写→
+            //   audit→member）。正常结果（200 带 token / 401 密码错 / 429 限流 / 403
+            //   禁用）都意味着**全链路在 wasm 上通了**，剩下的只是密码对不对；
+            //   若仍 1101 且无任何 JSON body = 该步有其它 wasm 不兼容点，再按 JWT/写细分。
             let body: dto::auth::AuthLoginDto = req.json().await.unwrap_or_default();
-            // 1) rate（已修，先验证 Mutex+SystemTime 版本在 wasm 上 OK）
-            if let Err(e) = rate
-                .hit("127.0.0.1", &body.username, 5, std::time::Duration::from_secs(60))
-            {
-                return ok_json(&serde_json::json!({"stage":"rate-limited","ok":false}));
-            }
-            // 2) db 读用户
-            let user = match db.get_user_by_username(&body.username).await {
-                Ok(Some(u)) => u,
-                Ok(None) => return ok_json(&serde_json::json!({"stage":"db-user-none","query":body.username})),
-                Err(e) => return err_json(&e),
-            };
-            // 3) status
-            if user.status != vtc_core::constants::status::ACTIVE {
-                return ok_json(&serde_json::json!({"stage":"status-disabled","status":user.status}));
-            }
-            // 4) 密码校验（PBKDF2；v6 到这一步就返回，单独验证它在 wasm 上跑通）
-            return match vtc_core::auth::password::verify_password(&body.password, &user.pass_hash) {
-                Ok(true) => ok_json(&serde_json::json!({"stage":"password-ok","next":"jwt"})),
-                Ok(false) => ok_json(&serde_json::json!({"stage":"bad-password","ok":false})),
-                Err(e) => ok_json(&serde_json::json!({"stage":"verify-err","ok":false,"err":e.to_string()})),
+            let auth = AuthService::new(db, jwt, rate, cfg.require_tmp, cfg.require_steam);
+            return match auth.login(&body, "127.0.0.1").await {
+                Ok(v) => ok_json(&v),
+                Err(e) => err_json(&e),
             };
         }
         ("/auth/refresh", Method::Post) => {

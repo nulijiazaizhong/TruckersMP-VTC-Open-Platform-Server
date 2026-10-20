@@ -27,3 +27,6 @@ smoke-test*
 
 # wrangler 状态
 .wrangler/
+
+# CF worker 构建产物（wasm-bindgen 生成的 index.js / wasm / snippets，cf-build.sh 现产）
+crates/vtc-worker/dist/

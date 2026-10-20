@@ -130,16 +130,36 @@ async fn exec(db: &D1Database, sql: &str, args: Vec<Arg>) -> AppResult<()> {
 }
 
 /// 取全部行的 JsValue（按列位置）。
-/// 0.8.6 的 `D1PreparedStatement::raw_js_value()` 返回**扁平** `Vec<JsValue>`
-/// （每 cell 一项，而非按行嵌套），故这里按 `cols` 重新分组为按行的结构。
-/// 注意：`raw<T>()` 要求 `T: Deserialize`，而 `JsValue` 不满足，故用 `raw_js_value()`。
-async fn raw_rows(db: &D1Database, sql: &str, args: Vec<Arg>, cols: usize) -> AppResult<Vec<Vec<JsValue>>> {
+/// ★ 0.8.6 的 `D1PreparedStatement::raw_js_value()` 返回 **`Vec<JsValue>`，每个元素是
+/// **一行**（一个 JsValue，行内是 `js_sys::Array` = [cell0, cell1, ...]），**不是**按 cell
+/// 拍平（早期注释「每 cell 一项」是错的）。D1 底层 `raw()` 返回「数组的数组」
+/// （`[[c0,c1,..],[..]`），`raw_js_value` 的 `array.to_vec()` 把顶层数组（每行一项）转
+/// `Vec<JsValue>`。故这里**遍历每个元素（行）**，把行（JsValue::Array）展开成 cells。
+/// 若按 cell 拍平的旧逻辑 `chunks_exact(cols)`：1 行 = 1 个 JsValue，`chunks_exact(13)`
+/// 需 13 个元素才一组 → 1 行被**整行丢弃** → `get_team` 返回 None → 「车队未初始化」。
+/// 注意：`raw<T>()` 要求 `T: Deserialize`，而 `JsValue` 不满足，故用 `raw_js_value()`
+/// 并手动展开每行。
+async fn raw_rows(db: &D1Database, sql: &str, args: Vec<Arg>, _cols: usize) -> AppResult<Vec<Vec<JsValue>>> {
+    use wasm_bindgen::JsCast;
     let st = db.prepare(sql).bind(&to_js(&args)).map_err(err)?;
-    let cells = st.raw_js_value().await.map_err(err)?;
-    Ok(cells
-        .chunks_exact(cols)
-        .map(|row| row.to_vec())
-        .collect())
+    let rows = st.raw_js_value().await.map_err(err)?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row_js in rows {
+        // 每行是一个 js_sys::Array（[cell0, cell1, ...]）。展开成 Vec<JsValue>。
+        // dyn_into（安全，失败返回 Err 不 panic）；若行不是 Array（理论上不会），退化单元素。
+        match row_js.dyn_into::<js_sys::Array>() {
+            Ok(arr) => {
+                let len = arr.length(); // u32
+                let mut cells = Vec::with_capacity(len as usize);
+                for i in 0..len {
+                    cells.push(arr.get(i)); // get 接受 u32 索引
+                }
+                out.push(cells);
+            }
+            Err(back) => out.push(vec![back]),
+        }
+    }
+    Ok(out)
 }
 
 /// 从 JsValue 提取 i64（D1 的 raw 数值一律是 JS number = f64）

@@ -30,6 +30,10 @@ wasm-bindgen = "=0.2.128"
 # 的 wasm-bindgen 后端），否则 backends 缺失报 E0425。uuid(v4)/rand 会传递引入 getrandom，
 # 这里显式开 wasm_js 让整棵依赖树在 unknown 目标下可编。
 getrandom = { version = "0.3", features = ["wasm_js"] }
+# js-sys（对齐 worker 0.8.6 用的 0.3.105）：db.rs 的 raw_rows 需要把 D1 raw_js_value 返回的
+# 每行 JsValue（实为 js_sys::Array = [cell0,cell1,..]）展开成 cells。worker crate 间接依赖
+# js-sys，但 `use js_sys::Array` 需 vtc-worker **直接**依赖（Cargo 不传递 re-export 的 use）。
+js-sys = "0.3.105"
 
 # 注：给 wasm 目标加 reference-types 的 rustflags 放在 `.cargo/config.toml`（本目录），
 # cargo 1.89 不认 Cargo.toml 里的 [target.<triple>.rustflags]（报 unused manifest key）。

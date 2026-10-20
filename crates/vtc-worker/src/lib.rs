@@ -267,12 +267,14 @@ async fn fetch_inner(mut req: Request, env: Env, _ctx: Context) -> Result<Respon
             if user.status != vtc_core::constants::status::ACTIVE {
                 return ok_json(&serde_json::json!({"stage":"status-disabled","status":user.status}));
             }
-            // 4) 密码校验（大循环 PBKDF2，CPU 重）
-            match vtc_core::auth::password::verify_password(&body.password, &user.pass_hash) {
-                Ok(true) => {}
-                Ok(false) => return ok_json(&serde_json::json!({"stage":"bad-password","ok":false})),
-                Err(e) => return ok_json(&stage_err("verify-password-err", &e)),
-            }
+            // 4) 密码校验（v4 第一刀：PBKDF2 21万次循环，先单独验证它在 wasm 上不 hang）
+            return match vtc_core::auth::password::verify_password(&body.password, &user.pass_hash) {
+                Ok(true) => ok_json(&serde_json::json!({"stage":"password-ok","next":"jwt"})),
+                Ok(false) => ok_json(&serde_json::json!({"stage":"bad-password","ok":false})),
+                Err(e) => ok_json(&stage_err("verify-password-err", &e)),
+            };
+            #[allow(unreachable_code)]
+            {
             // 5) JWT 签发
             let access = match jwt.issue_access(&user.id, &user.username, &user.role, &user.status) {
                 Ok(a) => a,
@@ -320,6 +322,7 @@ async fn fetch_inner(mut req: Request, env: Env, _ctx: Context) -> Result<Respon
                 "username":user.username,"role":user.role,
                 "access_len":access.len(),"refresh_len":refresh.len(),
             }));
+            } // end unreachable block
         }
         ("/auth/refresh", Method::Post) => {
             let body: dto::auth::AuthRefreshDto = req

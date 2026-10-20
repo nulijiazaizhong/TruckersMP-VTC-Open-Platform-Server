@@ -244,19 +244,31 @@ async fn fetch_inner(mut req: Request, env: Env, _ctx: Context) -> Result<Respon
             };
         }
         ("/auth/login", Method::Post) => {
-            // ★ 恢复真实完整登录（rate 已修：Mutex + SystemTime，wasm 安全；
-            // 经 v2/v4/v5 二分探针实锤：唯一崩溃源是 rate.hit 的 RwLock/Instant）。
+            // ★ v6 分段（rate 已修 Mutex+SystemTime）：db读→status→**密码**→停，带 stage。
+            // 完整 auth.login 仍崩（cpu 35ms 早崩）→ 定位 db读 之后哪一步。
+            // 过密码后下一轮推进 JWT / D1 写。
             let body: dto::auth::AuthLoginDto = req.json().await.unwrap_or_default();
-            let auth = AuthService::new(
-                db.clone(),
-                jwt.clone(),
-                rate.clone(),
-                cfg.require_tmp,
-                cfg.require_steam,
-            );
-            return match auth.login(&body, "127.0.0.1").await {
-                Ok(v) => ok_json(&v),
-                Err(e) => err_json(&e),
+            // 1) rate（已修，先验证 Mutex+SystemTime 版本在 wasm 上 OK）
+            if let Err(e) = rate
+                .hit("127.0.0.1", &body.username, 5, std::time::Duration::from_secs(60))
+            {
+                return ok_json(&serde_json::json!({"stage":"rate-limited","ok":false}));
+            }
+            // 2) db 读用户
+            let user = match db.get_user_by_username(&body.username).await {
+                Ok(Some(u)) => u,
+                Ok(None) => return ok_json(&serde_json::json!({"stage":"db-user-none","query":body.username})),
+                Err(e) => return err_json(&e),
+            };
+            // 3) status
+            if user.status != vtc_core::constants::status::ACTIVE {
+                return ok_json(&serde_json::json!({"stage":"status-disabled","status":user.status}));
+            }
+            // 4) 密码校验（PBKDF2；v6 到这一步就返回，单独验证它在 wasm 上跑通）
+            return match vtc_core::auth::password::verify_password(&body.password, &user.pass_hash) {
+                Ok(true) => ok_json(&serde_json::json!({"stage":"password-ok","next":"jwt"})),
+                Ok(false) => ok_json(&serde_json::json!({"stage":"bad-password","ok":false})),
+                Err(e) => ok_json(&serde_json::json!({"stage":"verify-err","ok":false,"err":e.to_string()})),
             };
         }
         ("/auth/refresh", Method::Post) => {

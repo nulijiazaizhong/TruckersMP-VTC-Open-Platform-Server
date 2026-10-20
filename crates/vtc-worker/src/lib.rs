@@ -251,28 +251,18 @@ async fn fetch_inner(mut req: Request, env: Env, _ctx: Context) -> Result<Respon
             let stage_err = |stage: &str, e: &AppError| {
                 serde_json::json!({"stage": stage, "ok": false, "err": e.to_string(), "status": e.status()})
             };
-            // 1) 限流（rate）
-            if let Err(e) = rate
-                .hit("127.0.0.1", &body.username, 5, std::time::Duration::from_secs(60))
-            {
-                return ok_json(&stage_err("rate-limited", &e));
-            }
-            // 2) D1 读用户
+            // ★ v5 隔离：去掉 rate.hit 与 status 检查（v4 比 v2 多出的两项，v4 崩、v2 过 →
+            // 元凶在二者之一）。本探针只保留 body + db读（=v2，已证明安全）+ 固定返回。
+            // 若 v5 过 → 确认元凶是 rate.hit 或 status；下一刀逐个加回定位。
             let user = match db.get_user_by_username(&body.username).await {
                 Ok(Some(u)) => u,
                 Ok(None) => return ok_json(&serde_json::json!({"stage":"db-user-none","query":body.username})),
                 Err(e) => return err_json(&e),
             };
-            // 3) 状态
-            if user.status != vtc_core::constants::status::ACTIVE {
-                return ok_json(&serde_json::json!({"stage":"status-disabled","status":user.status}));
-            }
-            // 4) 密码校验（v4 第一刀：PBKDF2 21万次循环，先单独验证它在 wasm 上不 hang）
-            return match vtc_core::auth::password::verify_password(&body.password, &user.pass_hash) {
-                Ok(true) => ok_json(&serde_json::json!({"stage":"password-ok","next":"jwt"})),
-                Ok(false) => ok_json(&serde_json::json!({"stage":"bad-password","ok":false})),
-                Err(e) => ok_json(&stage_err("verify-password-err", &e)),
-            };
+            let _ = &body;
+            return ok_json(&serde_json::json!({
+                "stage":"v5-isolated","ok":true,"username":user.username,"status":user.status,
+            }));
             #[allow(unreachable_code)]
             {
             // 5) JWT 签发

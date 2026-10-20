@@ -160,13 +160,17 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profil
   && bash crates/vtc-worker/cf-build.sh
 ```
 
-**部署命令**（整段粘贴）——装 wrangler、把 `wrangler.jsonc` 拷进产物目录、在产物目录里部署
-（`wrangler.jsonc` 的 `main: index.js` 会让 wrangler 把 `index.js` + `vtc_worker.wasm` 一起上传 = 「代码 Worker」）：
+**部署命令**（整段粘贴）——装 wrangler，在产物目录里用 `--remote-config` 部署。
+（`cf-build.sh` 已经在 `dist/` 里生成了一份**干净的 `wrangler.jsonc`**：无 `build` 字段、无占位符
+routes，`main: index.js` 让 wrangler 把 `index.js` + `vtc_worker.wasm` 一起上传 = 「代码 Worker」。
+**不要**再 `cp` 仓库原始 `wrangler.jsonc`（它带 `build` 字段会让 wrangler 重跑构建、带 `<D1_DATABASE_ID>`/
+`<ZONE_ID>` 占位符会让 deploy 校验失败——这正是「构建失败、线上还是 Hello World」的根因）。
+`--remote-config` 从 Cloudflare 拉回该 worker 已保存的 `DB`/`BUCKET` 绑定、secrets、正式域名路由，
+覆盖本地配置，占位符免填。）
 ```bash
 npm i -g wrangler@3 \
-  && cp crates/vtc-worker/wrangler.jsonc crates/vtc-worker/dist/ \
   && cd crates/vtc-worker/dist \
-  && wrangler deploy
+  && wrangler deploy --remote-config
 ```
 
 6. 点右下 **部署**。CF 开始首次构建（装 Rust 约 1–2 分钟 + build + deploy），完成后 worker 上线，

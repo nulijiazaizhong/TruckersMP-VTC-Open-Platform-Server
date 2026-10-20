@@ -146,8 +146,8 @@ worker 形态**零 C 依赖**（D1/R2 走 CF 托管，无 SQLite、无本地存�
 | **项目名称** | `vtc-server` | CF 默认填仓库 slug，建议改成和 worker 名一致（非必须）。 |
 | **构建命令** | 见下方「构建命令」整段 | CF 镜像无 Rust，**必须**现场装 rustup + wasm target，再跑仓库脚本。 |
 | **部署命令** | 见下方「部署命令」整段 | 装 wrangler、把配置拷进产物目录再 `wrangler deploy`。 |
-| **预览命令** | **留空** | worker-rs 本地预览易报错，不需要。 |
-| **启用预览构建** | **关** | 同上。 |
+| **预览命令** | `npm i -g wrangler@3 && cd crates/vtc-worker/dist && wrangler preview` | **必填字段**（CF 表单不允许空）。它只用于本地调试，**不影响正式部署**（部署走上面的「部署命令」）。worker-rs 本地预览可能因 `nodejs_compat` 模拟不完美而报错，**报错了也不影响 `wrangler deploy` 上线**，可忽略。 |
+| **启用预览构建** | **关** | 不需要 CI 跑预览。 |
 | **使用 Cloudflare Access 保护** | **关** | API 服务不用，需要时再开。 |
 | **高级设置** | 默认即可 | 展开可设 Rust 版本等，不填也行。 |
 

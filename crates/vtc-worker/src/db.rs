@@ -205,6 +205,23 @@ fn user_from_row(a: &[JsValue]) -> User {
     }
 }
 
+/// 从 `first::<serde_json::Value>` 返回的**对象**（按列名）构造 `User`。
+/// 与 `user_from_row`（按位置）等价，但走对象访问，绕开 raw_js_value 的数组展开。
+fn user_from_value(o: serde_json::Value) -> User {
+    let g = |k: &str| o.get(k);
+    User {
+        id: g("id").and_then(|v| v.as_str()).unwrap_or("").into(),
+        username: g("username").and_then(|v| v.as_str()).unwrap_or("").into(),
+        pass_hash: g("pass_hash").and_then(|v| v.as_str()).unwrap_or("").into(),
+        role: g("role").and_then(|v| v.as_str()).unwrap_or("").into(),
+        status: g("status").and_then(|v| v.as_str()).unwrap_or("").into(),
+        tmp_player_id: g("tmp_player_id").and_then(|v| v.as_str()).map(|s| s.into()),
+        steam_id: g("steam_id").and_then(|v| v.as_str()).map(|s| s.into()),
+        last_login: g("last_login").and_then(|v| v.as_str()).and_then(|s| dt_opt(&s)),
+        created_at: dt_req(g("created_at").and_then(|v| v.as_str()).unwrap_or("")),
+    }
+}
+
 fn member_from_row(a: &[JsValue]) -> Member {
     Member {
         id: jstr(a, 0).into(),
@@ -326,9 +343,14 @@ fn team_from_row(a: &[JsValue]) -> Team {
 impl vtc_core::backend::Db for D1Db {
     // ---------- 用户 ----------
     async fn get_user_by_username(&self, username: &str) -> AppResult<Option<User>> {
+        // ★ 不用 raw_rows/raw_js_value（其 dyn_into::<Array>/get 在 wasm 下 __wbg_new 崩，
+        // CF 日志定位到 get_user_by_username 返回真实行时）。改用 worker-rs 自带的
+        // first::<serde_json::Value>(None)：走 serde_wasm_bindgen 反序列化成**对象**
+        // {col:val}（非数组），单行查询最干净，完全绕开 raw_js_value 的数组展开。
         let sql = "SELECT id,username,pass_hash,role,status,tmp_player_id,steam_id,last_login,created_at FROM \"user\" WHERE username=?";
-        let rows = raw_rows(self, sql, vec![Arg::Text(username.into())], 9).await?;
-        Ok(rows.first().map(|r| r.as_slice()).map(user_from_row))
+        let st = self.0.prepare(sql).bind(&to_js(&[Arg::Text(username.into())])).map_err(err)?;
+        let obj: Option<serde_json::Value> = st.first::<serde_json::Value>(None).await.map_err(err)?;
+        Ok(obj.map(user_from_value))
     }
 
     async fn insert_user(&self, u: &User) -> AppResult<()> {

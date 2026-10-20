@@ -47,4 +47,8 @@ opt-level = "s"
 lto = true
 codegen-units = 1
 strip = true
+# panic=abort：worker 省 wasm 体积（不生成 unwind 表）。CF 构建**手动**跑 wasm-bindgen
+# （cf-build.sh，--target module），**不**用 worker-build（它强制 --force-enable-abort-handler
+# 与 abort 冲突）。module target 的 index.js 自实例化 wasm，不依赖 abort-handler 恢复，
+# 故 abort 安全。native（Docker axum）abort 亦 OK（panic 直接终止进程）。
 panic = "abort"

@@ -3,10 +3,14 @@
 # VTC 服务端 · Cloudflare Workers 构建脚本（供「从 Git 仓库部署」消费）
 #
 # 产出 Cloudflare 可部署的 worker 产物（ES Module worker）：
-#   $OUTPUT/index.js       —— wasm-bindgen 生成的 JS 胶水（CF 入口，含 `export function fetch`）
+#   $OUTPUT/index.js       —— wasm-bindgen（module target）生成的 JS 胶水，**自实例化**
+#                              wasm（`new WebAssembly.Instance(wasmModule, ...)` +
+#                              `__wbindgen_start()`），`export function fetch`
 #   $OUTPUT/index_bg.wasm  —— wasm-bindgen 重打包的 wasm（标准 wasm，00 61 73 6d 01 00 00 00）
 #   $OUTPUT/snippets/      —— worker-macros 生成的状态初始化 JS（index.js 会 import 它）
-#   $OUTPUT/wrangler.jsonc —— 部署配置（main=index.js，D1/R2 绑定按名字）
+#   $OUTPUT/worker.js      —— CF modules 入口（`import { fetch } from './index.js';
+#                              export default { fetch }`），让 wrangler 走 modules 格式
+#   $OUTPUT/wrangler.jsonc —— 部署配置（main=worker.js，D1/R2 绑定按名字）
 #
 # 为什么目标必须是 wasm32-unknown-unknown（**不是** wasm32-wasip2）：
 #   worker 0.8.6 的 worker crate 依赖 wasm-bindgen/web-sys/js-sys（纯 wasm-bindgen 栈）。
@@ -14,12 +18,29 @@
 #   只认标准 wasm（01 00 00 00）→ 上传报 "expected version 01 00 00 00, found 0d 00 01 00"。
 #   wasm32-unknown-unknown 产出标准 wasm + wasm-bindgen 胶水，CF 能跑。
 #
-# 为什么手动跑 wasm-bindgen 而**不用** worker-build：
-#   worker-build 0.8.6 默认给 wasm-bindgen 传 --force-enable-abort-handler（catch wrappers），
-#   需要 wasm 带 reference-types/exception-handling，但它在 wasm-bindgen 步骤（先于 wasm-opt
-#   的 --enable-exception-handling）就失败 → "externref table required for catch wrappers"。
-#   本项目 panic=abort（workspace [profile.release]），**不需要** abort handler 恢复，
-#   所以手动跑 wasm-bindgen 时**不传** --force-enable-abort-handler 即可绕过。
+# 为什么 wasm-bindgen 用 **--target module**（worker-build 同款 target，**不是** bundler/web）：
+#   - module target 的 index.js 用 `import source wasmModule from "./index_bg.wasm"`
+#     （esbuild source-phase import），wrangler v4 能正确内联 wasm；且 index.js **末尾
+#     自实例化**：`new WebAssembly.Instance(wasmModule, __wbg_get_imports())` +
+#     `wasm.__wbindgen_start()`（完整初始化 wasm 导出表），`export function fetch` 直接可用。
+#   - **不用 bundler target**：bundler 的 index.js 有 0.2.128 的 re-export bug
+#     （`export { __wbg_reset_state } from "./index_bg.js"` 但 index_bg.js 没导出它），
+#     且 wrangler 内联 bundler 的 `import * as wasm` 时 `wasm.fetch`/`__wbindgen_start`
+#     取不到（CF 反复报 `wasm.fetch is not a function` / `__wbindgen_start is not a function`）。
+#   - **不用 web target**：web 用运行时 `__wbg_load` async 加载 wasm，CF worker 无文件系统
+#     断链 → `wasm` 永远 undefined。
+#   - **不用 worker-build**：worker-build（0.8.x）给 wasm-bindgen 传
+#     `--force-enable-abort-handler`（catch wrappers），与本项目 `panic=abort` 冲突
+#     （"externref table required for catch wrappers"）。手动跑 wasm-bindgen 时**不传**
+#     该 flag 即可绕过；module target 的 index.js 已自实例化，无需 worker-build 的额外处理。
+#
+# 为什么还要 worker.js 包一层 `export default { fetch }`：
+#   module target 的 index.js 是 `export function fetch`（命名导出，**没有** export
+#   default）。wrangler 判定 worker 格式时，「有顶层 export 但**没有** export default」
+#   会退回 service-worker 格式（认 self.onfetch，不认顶层 fetch 导出）→ 请求进来 0ms
+#   空返回（CF 日志 outcome:ok 但 wallTimeMs:0，客户端 522/超时）。worker.js 把它转成
+#   CF modules 格式期望的 `export default { fetch }`；`import { fetch } from './index.js'`
+#   会触发 index.js 整个模块加载（含末尾的 wasm 实例化 + __wbindgen_start），初始化完成。
 #
 # 用法：
 #   cf-build.sh                 # 输出到默认 dist/
@@ -52,9 +73,8 @@ fi
 if ! command -v wasm-bindgen >/dev/null 2>&1; then
   echo "==> 安装 wasm-bindgen-cli 0.2.128（首次构建需 ~1-2 分钟编译）"
   cargo install wasm-bindgen-cli --version 0.2.128 --locked
-else
-  echo "==> wasm-bindgen: $(wasm-bindgen --version)"
 fi
+echo "==> wasm-bindgen: $(wasm-bindgen --version)"
 
 echo "==> cargo build -p vtc-worker --target wasm32-unknown-unknown --release"
 cargo build -p vtc-worker --target wasm32-unknown-unknown --release
@@ -66,71 +86,42 @@ if [[ ! -f "$WASM_TARGET" ]]; then
 fi
 
 # 清产物目录，跑 wasm-bindgen 生成 JS 胶水 + 重打包 wasm。
-# ★ --target bundler（**不是** web / module）：
-#   - web target：`export function fetch` 直接可用，但 wasm 用**运行时** `__wbg_load`
-#     async 加载（`new WebAssembly.Instance(wasmModule, ...)`），CF worker 无文件系统、
-#     无人传 wasm bytes → `wasm` 变量永远 undefined → `fetch` 调用崩
-#     （CF 日志 `Cannot read properties of undefined (reading 'fetch')`，index.js:491）。
-#   - module target：`import source wasmModule from "./index_bg.wasm"`（source phase
-#     import），wrangler v3/v4 的 esbuild 解析不了（"Expected 'from' but found 'wasmModule'"）。
-#   - **bundler target**：`import * as wasm from "./index_bg.wasm"`（静态 ES module import），
-#     wrangler 把 wasm 作为 compiled-wasm module **内联**进 worker bundle（~867KB），
-#     CF 运行时 wasm 已就位，`__wbg_set_wasm(wasm)` 注入有效。
-# ★ 不传 --force-enable-abort-handler（panic=abort 不需要 catch wrappers，
-#   绕开 worker-build 0.8.6 的 "externref table required" 死锁）。
+# ★ --target module（worker-build 同款；见文件头注释为何不用 bundler/web/worker-build）。
+# ★ 不传 --force-enable-abort-handler（panic=abort 不需要 catch wrappers，绕开
+#   worker-build 的 "externref table required" 死锁）。
 mkdir -p "$OUTPUT"
 rm -rf "$OUTPUT"/*
 wasm-bindgen "$WASM_TARGET" \
   --out-dir "$OUTPUT" \
   --no-typescript \
-  --target bundler \
+  --target module \
   --out-name index
 
-if [[ ! -f "$OUTPUT/index_bg.js" || ! -f "$OUTPUT/index_bg.wasm" ]]; then
-  echo "!! wasm-bindgen 未产出 index_bg.js / index_bg.wasm" >&2
+if [[ ! -f "$OUTPUT/index.js" || ! -f "$OUTPUT/index_bg.wasm" ]]; then
+  echo "!! wasm-bindgen 未产出 index.js / index_bg.wasm" >&2
   ls -lh "$OUTPUT" >&2
   exit 1
 fi
 
-# ★ 生成 CF modules 入口 worker.js。两个要点：
-#   (1) **直接 import index_bg.js，不经过 index.js**：wasm-bindgen 0.2.128 的 bundler
-#       target 产出的 index.js 有一行 `export { ..., __wbg_reset_state, ... } from
-#       "./index_bg.js"`，但 index_bg.js **没**导出 `__wbg_reset_state`（0.2.128 的
-#       re-export 列表 bug）→ wrangler esbuild 报 "No matching export"。index_bg.js
-#       自己**确实** `export function fetch` + `export function __wbg_set_wasm`，
-#       直接 import 它即可绕开 index.js 的 bug 行。
-#   (2) **export default { fetch }**：wrangler 判定 worker 格式时，「有顶层 export 但
-#       没有 export default」会退回 service-worker 格式（认 self.onfetch，不认顶层
-#       fetch 导出）→ 请求进来 0ms 空返回（CF 日志 outcome:ok 但 wallTimeMs:0）。
-#       CF modules 格式要求 `export default { fetch }`。
-#   (3) **`import wasm from "./index_bg.wasm"`（默认导入）+ `__wbg_set_wasm(wasm)` +
-#       `wasm.__wbindgen_start()`**：把 wrangler 内联的 wasm（exports 对象）注入
-#       index_bg.js 的模块级 `wasm` 变量，并调 `__wbindgen_start()` 初始化 wasm 导出表
-#       （激活 `fetch` 等导出；漏了它 `wasm.fetch` 不是函数 → CF 报 `wasm.fetch is not a
-#       function` @ index_bg.js:491）。
-#       ★ 必须用**默认导入** `import wasm`（不是 `import * as wasm`）：默认导入 = wrangler
-#       内联的 exports 对象（`fetch`/`__wbindgen_start` 都在顶层）。`import * as wasm`
-#       得到命名空间包装 { default: exports }，顶层取不到 → 部署期
-#       `wasm.__wbindgen_start is not a function`。默认导入下两者都在顶层，可正常调。
-#       这套与 worker-build / wasm-bindgen bundler target 的 index.js 同款初始化，只是
-#       不 re-export（绕开 index.js 的 0.2.128 re-export bug），改用 export default。
+# ★ 生成 CF modules 入口 worker.js（module target 版）。
+#   `import { fetch } from './index.js'` 触发 index.js 整个模块加载：
+#     - 顶部 `import source wasmModule from "./index_bg.wasm"`（wrangler 内联 wasm）
+#     - 末尾 `new WebAssembly.Instance(wasmModule, __wbg_get_imports())` +
+#       `wasm.__wbindgen_start()`（自实例化 + 激活导出表）
+#   然后 `export default { fetch }` 让 wrangler 走 modules 格式（认 default 对象，
+#   否则「有 export 无 default」退回 service-worker 格式 → 0ms 空返回）。
 cat > "$OUTPUT/worker.js" <<'JS'
-import wasm from "./index_bg.wasm";
-import { __wbg_set_wasm, fetch } from "./index_bg.js";
-__wbg_set_wasm(wasm);
-wasm.__wbindgen_start();
+import { fetch } from './index.js';
 export default { fetch };
 JS
 
 # 生成一份「部署用」的干净 wrangler.jsonc 到产物目录：
 #   - 无 build 字段：CF Builds 已单独跑构建命令，wrangler deploy 不该再跑 cf-build.sh。
 #   - 无 routes：正式域名路由在 Cloudflare Dashboard 配（wrangler deploy 按名字匹配绑定）。
-#   - main = index.js（wasm-bindgen 胶水），它会加载同目录的 index_bg.wasm + snippets/。
+#   - main = worker.js（modules 包装入口），它 import index.js（自实例化 wasm）。
 #   - ★ wrangler v4 语法：D1/R2 用顶层 `d1_databases` / `r2_buckets`（**不是** `bindings`
 #     数组——那个字段 v3/v4 都不认，会被忽略且 D1/R2 绑不上）。按 database_name /
 #     bucket_name 名字引用（v4 支持，不强制 database_id/bucket_id，CF 按名字找已建的）。
-# ★ main = worker.js（modules 包装入口），**不是** index.js（wasm-bindgen 命名导出）。
-#   见上方 worker.js 生成注释：wrangler 需要 export default 才走 modules 格式。
 cat > "$OUTPUT/wrangler.jsonc" <<'JSONC'
 {
   "name": "vtc-server",
@@ -153,5 +144,5 @@ JSONC
 
 echo "==> 产物就绪："
 ls -lhR "$OUTPUT"
-echo "==> 完成。CF 入口 = index.js，wasm = index_bg.wasm（+ snippets/），部署配置 = wrangler.jsonc"
+echo "==> 完成。CF 入口 = worker.js（import index.js 自实例化 wasm），部署配置 = wrangler.jsonc"
 echo "==> 部署命令：npm i -g wrangler@4 && cd <dist> && wrangler deploy"

@@ -153,8 +153,31 @@ fn require_admin(claims: &Claims) -> Result<(), AppError> {
 /// `#[worker::event(fetch)]` 入口：0.8.6 的宏要求**恰好 3 个参数**
 /// `(req: Request, env: Env, ctx: Context)`。
 #[worker::event(fetch)]
-async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response, Error> {
-    let url = req.url()?;
+// ★ fetch 入口（worker-rs 事件）：**永不**返回 `Err`。`fetch_inner` 返回
+// `Result`，这里 `.unwrap_or_else` 把任何 `Err`（含内部 `ok_json/err_json` 的
+// `?`、`env.d1?` 等）转成 `Ok(text(500, msg))`，彻底封死 `to_js_value`→`new Error`
+// （`__wbg_new`）的 `Critical` 崩溃路径。
+async fn fetch(req: Request, env: Env, ctx: Context) -> Result<Response, Error> {
+    match fetch_inner(req, env, ctx).await {
+        Ok(resp) => Ok(resp),
+        Err(e) => {
+            // 把 worker::Error 的字符串塞进 500 body（诊断）；`text` 自身也 `?`，
+            // 再失败则用最小 Response 兜底，**保证** `fetch` 永不返回 `Err`。
+            // `text` 内部 `ok(String)` 对合法 status 不失败，`expect` 仅理论兜底。
+            Ok(text(500, format!("worker 内部错误：{e}")).expect("500 text response"))
+        }
+    }
+}
+
+async fn fetch_inner(mut req: Request, env: Env, _ctx: Context) -> Result<Response, Error> {
+    // ★ fetch **永不**返回 `Err(worker::Error)`：worker-rs 宏对 `Err` 会
+    // `to_js_value` → `js_sys::Error::new(msg)`（= `__wbg_new`），在 wasm 下若 msg
+    // 异常/边界触发 `Critical`（CF 日志反复定位的 `new Error` 崩溃）。故所有 `?`
+    // 改捕获并返回 `Ok(text(500, msg))`，把 `fetch` 的 `Err` 路径彻底封死。
+    let url = match req.url() {
+        Ok(u) => u,
+        Err(e) => return text(500, format!("解析请求 URL 失败：{e}")),
+    };
     let path = url.path().trim_end_matches('/').to_string();
     // `Method` 非 Copy，`match` 会 move，故 clone 一份用于 match 条件
     let method = req.method();
@@ -162,9 +185,15 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response, Er
     // 去掉 /api/v1 前缀
     let path = path.strip_prefix("/api/v1").unwrap_or(&path).to_string();
 
-    // 装配后端（D1 + R2）。`?` 在绑定缺失（未配 DB/BUCKET）时提前返回，避免空指针。
-    let d1: D1Database = env.d1(D1_BINDING)?;
-    let bucket: Bucket = env.get_binding::<Bucket>(R2_BINDING)?;
+    // 装配后端（D1 + R2）。绑定缺失（未配 DB/BUCKET）→ 返回 500 而非 `Err`。
+    let d1: D1Database = match env.d1(D1_BINDING) {
+        Ok(d) => d,
+        Err(e) => return text(500, format!("D1 绑定 `{D1_BINDING}` 缺失：{e}")),
+    };
+    let bucket: Bucket = match env.get_binding::<Bucket>(R2_BINDING) {
+        Ok(b) => b,
+        Err(e) => return text(500, format!("R2 绑定 `{R2_BINDING}` 缺失：{e}")),
+    };
     let cfg = worker_config();
     let db: Arc<db::D1Db> = Arc::new(db::D1Db::new(d1));
     let storage: Arc<storage::R2Storage> =

@@ -64,6 +64,10 @@ fn b64url_decode(s: &str) -> AppResult<Vec<u8>> {
     let mut acc: u32 = 0;
     let mut bits: u32 = 0;
     for c in s.chars() {
+        // 防御：跳过空白（合法 token 绝不应因一个多余空格 400；真实客户端偶尔夹带）
+        if c.is_whitespace() {
+            continue;
+        }
         let v = match c {
             'A'..='Z' => c as u32 - 'A' as u32,
             'a'..='z' => c as u32 - 'a' as u32 + 26,

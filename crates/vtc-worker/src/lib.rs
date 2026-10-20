@@ -134,9 +134,20 @@ fn bearer_token(req: &Request) -> Option<String> {
         .ok()
         .flatten()
         .and_then(|h| {
-            h.strip_prefix("Bearer ")
+            // 大小写不敏感地剥掉 `Bearer ` 前缀，并 **trim** 掉首尾空白。
+            // 真实客户端偶尔发 `Bearer  <token>`（双空格）或带 `\r`；若不 trim，残留下
+            // 一个空格会进入 JWT 的 base64url 解码 → 误报 1001「无效 base64url 字符」。
+            let h = h.trim();
+            let rest = h
+                .strip_prefix("Bearer ")
                 .or_else(|| h.strip_prefix("bearer "))
-                .map(str::to_string)
+                .or_else(|| {
+                    let lower = h.to_ascii_lowercase();
+                    lower.strip_prefix("bearer").map(|_| &h["bearer".len()..])
+                })
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            rest.map(str::to_string)
         })
 }
 

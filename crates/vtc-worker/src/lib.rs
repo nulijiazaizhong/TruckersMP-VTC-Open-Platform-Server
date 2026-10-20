@@ -244,22 +244,17 @@ async fn fetch_inner(mut req: Request, env: Env, _ctx: Context) -> Result<Respon
             };
         }
         ("/auth/login", Method::Post) => {
-            // ★ 二分探针：login 分支先**什么都不做**，直接返回固定 200 JSON。
-            //   若此固定响应成功 → 崩溃在 login 后续（auth_service/D1/…）；
-            //   若仍 __wbg_new/hang → 崩溃在共享前置（ensure_ready/worker_services/…）或更底层。
-            // 定位后移除本行、恢复下方真实逻辑。
-            return ok_json(&serde_json::json!({"probe":"login-branch","ok":true}));
-            #[allow(unreachable_code)]
+            // ★ 分段探针 v2：已确认共享前置 OK、崩溃在 login 处理。
+            // 本次只做到「解析 body + D1 读用户」，回显用户是否存在 + 任何 D1 错误；
+            // 不碰密码哈希 / JWT / 写库。据此区分：崩在 D1 读，还是崩在后续步骤。
             let body: dto::auth::AuthLoginDto = req.json().await.unwrap_or_default();
-            let auth = AuthService::new(
-                db.clone(),
-                jwt.clone(),
-                rate.clone(),
-                cfg.require_tmp,
-                cfg.require_steam,
-            );
-            return match auth.login(&body, "127.0.0.1").await {
-                Ok(v) => ok_json(&v),
+            return match db.get_user_by_username(&body.username).await {
+                Ok(Some(u)) => ok_json(&serde_json::json!({
+                    "stage":"db-user-found","username":u.username,"id":u.id,"status":u.status,
+                })),
+                Ok(None) => ok_json(&serde_json::json!({
+                    "stage":"db-user-none","query":body.username,
+                })),
                 Err(e) => err_json(&e),
             };
         }

@@ -87,6 +87,21 @@ if [[ ! -f "$OUTPUT/index.js" || ! -f "$OUTPUT/index_bg.wasm" ]]; then
   exit 1
 fi
 
+# ★ 生成 CF modules 入口 worker.js（包装 wasm-bindgen 的命名导出为 export default）。
+#   原因：wrangler 判定 worker 格式时，「有顶层 export 但**没有** export default」会退回
+#   service-worker 格式（认 self.onfetch，不认顶层 fetch 导出）→ 请求进来 0ms 空返回
+#   （CF 日志 outcome:ok 但 wallTimeMs:0，客户端 522/超时）。
+#   worker-rs 的 worker-macros 让 wasm-bindgen 产出 `export function fetch(req, env, ctx)`
+#   （命名导出，无 default）。CF modules 格式要求 `export default { fetch }`。
+#   这个 worker.js 把命名导出 `fetch` 转成 modules 期望的 default 对象导出：
+#     import { fetch as vtcFetch } from './index.js';
+#     export default { fetch: vtcFetch };
+#   签名 (req, env, ctx) 与 module worker 的 fetch 一致，直接透传。
+cat > "$OUTPUT/worker.js" <<'JS'
+import { fetch as vtcFetch } from './index.js';
+export default { fetch: vtcFetch };
+JS
+
 # 生成一份「部署用」的干净 wrangler.jsonc 到产物目录：
 #   - 无 build 字段：CF Builds 已单独跑构建命令，wrangler deploy 不该再跑 cf-build.sh。
 #   - 无 routes：正式域名路由在 Cloudflare Dashboard 配（wrangler deploy 按名字匹配绑定）。
@@ -94,10 +109,12 @@ fi
 #   - ★ wrangler v4 语法：D1/R2 用顶层 `d1_databases` / `r2_buckets`（**不是** `bindings`
 #     数组——那个字段 v3/v4 都不认，会被忽略且 D1/R2 绑不上）。按 database_name /
 #     bucket_name 名字引用（v4 支持，不强制 database_id/bucket_id，CF 按名字找已建的）。
+# ★ main = worker.js（modules 包装入口），**不是** index.js（wasm-bindgen 命名导出）。
+#   见上方 worker.js 生成注释：wrangler 需要 export default 才走 modules 格式。
 cat > "$OUTPUT/wrangler.jsonc" <<'JSONC'
 {
   "name": "vtc-server",
-  "main": "index.js",
+  "main": "worker.js",
   "compatibility_date": "2025-08-01",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,

@@ -5,8 +5,10 @@
   // 前提资源：
   //   wrangler d1 create vtc          → 填 database_id
   //   wrangler r2 bucket create vtc-saves
+  // 入口 = index.js（加载 vtc_worker.wasm 并导出 fetch）；wasm 由 cargo 产出到
+  // target/wasm32-wasip2/release/vtc_worker.wasm，部署前需拷到本目录（cf-build.sh 自动做）。
   "name": "vtc-server",
-  "main": "src/lib.rs",
+  "main": "index.js",
   "compatibility_date": "2025-08-01",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,

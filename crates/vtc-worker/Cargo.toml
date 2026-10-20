@@ -8,12 +8,33 @@ license.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-[target.wasm32-wasip2.dependencies]
+# ★ 目标必须是 wasm32-unknown-unknown（wasm-bindgen web 目标），**不能**是 wasm32-wasip2：
+#   worker 0.8.6 的 worker crate 依赖 wasm-bindgen / web-sys / js-sys（见其 Cargo.toml），
+#   是纯 wasm-bindgen 栈。wasip2 目标产出 WASI reactor 格式 wasm（magic 0d 00 01 00），
+#   CF Workers 的 WasmModuleObject 只认标准 wasm（01 00 00 00）→ 上传报
+#   "expected version 01 00 00 00, found 0d 00 01 00" [code 10021]。
+#   wasm32-unknown-unknown 产出标准 wasm + wasm-bindgen 胶水，CF 能跑。
+[target.wasm32-unknown-unknown.dependencies]
 # 固定 0.8.6：0.8.7 把 MSRV 提到 rustc 1.91（本机 1.89 不支持），0.8.6 的 MSRV=1.75 且 API 一致
 # features：d1（D1 模块）、http；r2 在 0.8.6 无 feature 门控（始终可用）
 worker = { version = "=0.8.6", features = ["d1", "http"] }
 worker-macros = "=0.8.6"
 console_error_panic_hook = "0.1"
+# 锁 wasm-bindgen 到 0.2.128：worker-build 0.8.6 期望 0.2.128（见其 versions.rs）。
+# worker crate 的 wasm-bindgen="0.2.128" 是 ^0.2.128，会解析到 0.2.129（最新），
+# 但 0.2.129 的 catch wrappers 行为与 worker-build 0.8.6 不匹配（要 exception-handling，
+# 而 wasm-bindgen 步骤先于 wasm-opt 的 --enable-exception-handling）→ "externref table
+# required for catch wrappers"。强制 =0.2.128 对齐 worker-build 期望。
+wasm-bindgen = "=0.2.128"
+# getrandom 0.3.x 在 wasm32-unknown-unknown 下需要 wasm_js feature（走 crypto.getRandomValues
+# 的 wasm-bindgen 后端），否则 backends 缺失报 E0425。uuid(v4)/rand 会传递引入 getrandom，
+# 这里显式开 wasm_js 让整棵依赖树在 unknown 目标下可编。
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
+# 注：给 wasm 目标加 reference-types 的 rustflags 放在 `.cargo/config.toml`（本目录），
+# cargo 1.89 不认 Cargo.toml 里的 [target.<triple>.rustflags]（报 unused manifest key）。
+# cf-build.sh 手动跑 wasm-bindgen 不传 --force-enable-abort-handler，所以 reference-types
+# 非必需；保留 .cargo/config.toml 以备未来需要 catch wrappers 时 wasm 已原生带该特性。
 
 [dependencies]
 # vtc-core 开 `worker` feature → 后端 trait 用 ?Send（D1/R2 非 Send，wasm 单线程）
@@ -26,7 +47,10 @@ serde_json = { workspace = true }
 serde_urlencoded = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
-uuid = { workspace = true }
+# uuid 在 wasm32-unknown-unknown 下需要 js feature（其 v4/rng 走 wasm-bindgen 后端），
+# 否则 uuid 的 rng.rs 报 E0433（js 后端缺失）。js feature 在 x86 下惰性无副作用，
+# 但这里只在 worker 目标下追加，避免污染 Docker 形态的 feature 集合。
+uuid = { workspace = true, features = ["js"] }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }

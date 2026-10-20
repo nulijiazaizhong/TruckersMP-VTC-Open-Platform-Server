@@ -1,0 +1,9 @@
+# worker-build 的 wasm-bindgen 用 --force-enable-abort-handler，需要 wasm 带
+# reference-types（externref）+ exception-handling。让 rustc 在 wasm 目标编译时
+# 就开启这些特性（wasm 原生带），wasm-bindgen 就不用事后注入 catch wrappers。
+#
+# 按精确 target triple 配 rustflags（cargo 1.89 认 .cargo/config.toml 的这个形式，
+# 不认 Cargo.toml 里的 [target.<triple>.rustflags]）。只对 wasm32-unknown-unknown
+# 生效，不污染 host/proc-macro 编译。
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+reference-types,+exception-handling"]

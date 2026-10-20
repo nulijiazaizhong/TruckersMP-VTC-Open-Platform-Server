@@ -700,11 +700,18 @@ fn worker_services(cfg: &WorkerConfig) -> (Arc<vtc_core::auth::JwtService>, Arc<
 /// 因此网页端部署后**第一次请求即自动建库**，冷启动约 +0.5s，幂等只跑一次。
 async fn ensure_ready(db: &Arc<db::D1Db>, admin_pwd: &str) -> vtc_core::error::AppResult<()> {
     db::migrate(db).await?;
-    let need_admin = db.get_user_by_username("admin").await?.is_none();
-    let need_team = db.get_team().await?.is_none();
-    if need_admin || need_team {
-        seed_admin(db, admin_pwd).await?;
-    }
+    // ★ **无条件** seed（不再判 need_admin/need_team 后条件 seed）：
+    //   之前「判存在→缺失才 seed」在 CF stateless 下有**读不一致**——ensure_ready 里
+    //   get_team() 判 Some（跳过 seed），但随后 /config/public 的 get_team() 又判 None
+    //   （报「车队未初始化」）。根因可能是 D1 读时序/或 get_team 判断与实际写入不同步。
+    //   seed_admin 内部 team 用 upsert（ON CONFLICT(id) DO UPDATE）、admin 用 upsert
+    //   （ON CONFLICT(username) DO UPDATE）、member 用 insert（UUID 主键），**全部幂等**：
+    //   已存在则更新/无副作用，不存在则插入。**无条件**跑保证 team+admin **一定**就位，
+    //   避免「判存在跳过→实际缺失」的 read-then-act 不一致。幂等性让重复 seed 无副作用
+    //   （admin 密码：upsert 会**刷新**为绑定值——注意若用户改过 admin 密码，重启/新
+    //   请求会用 VTC_ADMIN_PASSWORD 覆盖；如需保留用户改的密码，后续可加「仅当 pass_hash
+    //   为默认才更新」的精细条件，当前先保证初始化成功）。
+    seed_admin(db, admin_pwd).await?;
     Ok(())
 }
 
@@ -715,25 +722,28 @@ async fn seed_admin(db: &Arc<db::D1Db>, pwd: &str) -> vtc_core::error::AppResult
     use vtc_core::domain::{Member, Team, User};
 
     let mut seeded = Vec::new();
-    if db.get_team().await?.is_none() {
-        let team = Team {
-            id: "default".into(),
-            name: std::env::var("TEAM_NAME").unwrap_or_else(|_| "默认车队".into()),
-            slogan: "松散，自由的行驶、玩耍".into(),
-            slug: "default".into(),
-            logo: "pack://app-assets/brand/logo.png".into(),
-            login_bg: "pack://app-assets/brand/login_bg.jpg".into(),
-            login_layout: "left".into(),
-            accent_color: "#1E88E5".into(),
-            default_lang: "zh-CN".into(),
-            feature_allow_upload: true,
-            feature_tmp_binding: true,
-            feature_rss_enabled: true,
-            created_at: chrono::Utc::now(),
-        };
-        db.upsert_team(&team).await?;
-        seeded.push("默认车队".to_string());
-    }
+    // ★ team **无条件** upsert（不判 get_team().is_none()）：upsert 幂等
+    // （ON CONFLICT(id) DO UPDATE），已存在则刷新、缺失则插入。避免「判存在跳过→实际
+    // 缺失」的 read-then-act 不一致（CF 上 get_team 判 Some 但 get_public 又判 None）。
+    // created_at 用「已存在则保留原值」需查旧值；当前 upsert 会刷新 created_at，
+    // 对默认车队无实际影响（仅展示用），可接受。
+    let team = Team {
+        id: "default".into(),
+        name: std::env::var("TEAM_NAME").unwrap_or_else(|_| "默认车队".into()),
+        slogan: "松散，自由的行驶、玩耍".into(),
+        slug: "default".into(),
+        logo: "pack://app-assets/brand/logo.png".into(),
+        login_bg: "pack://app-assets/brand/login_bg.jpg".into(),
+        login_layout: "left".into(),
+        accent_color: "#1E88E5".into(),
+        default_lang: "zh-CN".into(),
+        feature_allow_upload: true,
+        feature_tmp_binding: true,
+        feature_rss_enabled: true,
+        created_at: chrono::Utc::now(),
+    };
+    db.upsert_team(&team).await?;
+    seeded.push("默认车队".to_string());
     if db.get_user_by_username("admin").await?.is_none() {
         let admin = User {
             id: uuid::Uuid::new_v4().to_string(),

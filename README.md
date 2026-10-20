@@ -64,14 +64,27 @@ wrangler deploy
 - 地图 DLC 模板文件（`map-dlc/1.61.ets2.txt` 10 条 / `ats` 20 条）复用。
 - 种子：admin / `ChangeMe123!`（`ADMIN_INITIAL_PASSWORD` 覆盖）、默认车队。
 
-## 已知边界（P0 范围）
+## 双目标 async 边界（P1 已解决）
+
+Docker/axum 的 `Handler` 要求 future 是 **Send**；Cloudflare worker 的 D1/R2 绑定是
+`Rc`/`Arc<D1Database>`（**非 Send**，wasm 单线程）。二者无法共享同一套 `Arc<dyn Db>`。
+
+**解法（已实现）**：
+1. **service 层全部泛型**——`ConfigService<D: Db>`、`SaveService<D: Db, S: Storage>` 等，
+   持有具体 `Arc<D>`/`Arc<S>`，**不持 `Arc<dyn Db>`**。Send 边界由具体类型 + trait 的 Send 开关决定。
+2. **后端 trait 按 vtc-core 的 cargo feature `worker` 门控**（cargo feature 按依赖边生效）：
+   - `vtc-server` 依赖 vtc-core（默认）→ 三个 trait 用 `#[async_trait]`（**Send**）→ axum 可用。
+   - `vtc-worker` 依赖 vtc-core 开 `features=["worker"]` → 三个 trait 用 `#[async_trait(?Send)]`
+     → D1/R2（非 Send）可用。每个 trait 有两个 cfg 孪生定义（签名一致，仅 Send 开关不同）。
+
+service 代码两种 feature 下**完全相同**——这是"一份代码双编译"在 async 边界上的真正落地。
+
+## 其它边界
 
 - **推送**：Docker 用内存存根、CF 用 Durable Objects 骨架，**WebSocket 真实推送在 P1**。
 - **S3/PostgreSQL**：Docker 默认 SQLite + 本地存储；S3/PG 是 P1（接口已留）。
-- **CF worker 形态的 D1/R2 适配（P1）**：`vtc-core` 业务逻辑（service/DTO/auth/domain）**两种形态 100% 共享**。
-  但后端装配层存在一个 Rust 固有的 async 边界：**Docker/axum 的 `Handler` 要求 future 是 `Send`，
-  故 `Db`/`Storage`/`Push` trait 带 `Send + Sync` 超 trait；而 worker 0.8 的 D1/R2 绑定是 `Rc<...>`（非 Send，
-  wasm 单线程模型）。** 二者无法共享同一套 `Arc<dyn Db>` trait 对象。
+- **C 依赖规避**：手写 JWT/PBKDF2（不拉 jsonwebtoken/pbkdf2 → 避免 ring C 编译）；
+  SQLite 用预编译库（不 bundled）。这是为适应无 C 编译器环境的工程取舍，生产可换回 bundled。
   - **P0 交付**：Docker 自部署形态（编译绿 + 运行时全链路冒烟通过：health/config/login/members/dlc=10/401）。
   - **P1 适配**：让 service 对后端**泛型**（`<D: Db>` 而非 `Arc<dyn Db>`），即可让同一份 service
     在 Docker（Send 具体类型）与 worker（`?Send` 的 `Rc<D1/R2>`）下分别成立。worker 的 D1 `db.rs` /

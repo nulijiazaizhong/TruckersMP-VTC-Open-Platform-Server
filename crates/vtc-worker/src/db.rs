@@ -5,14 +5,16 @@
 //! - 行读取用 `raw::<JsValue>()` → `Vec<Vec<JsValue>>`（D1 按列位置返回值），再按位置映射到 domain。
 //! - SQL 与 SQLite 版（vtc-server/src/db.rs）**原样复用**（时间存 TEXT；D1 不支持 `'%'||?||'%'`，
 //!   LIKE 用 `?` 绑定，`%` 在 Rust 侧拼）。
-//! - `Db` 由 `Arc<D1Database>` 实现：D1Database 非 Sync，包 Arc 后 Send+Sync（worker 单线程）。
+//! - `Db` 由**本 crate 的 `D1Db`** 实现（orphan rule：不能给外部 `Arc<D1Database>` 实现外部 `Db` trait），
+//!   内部持 `Arc<D1Database>`（D1Database 在 0.8.6 里 Send+Sync，包 Arc 便于跨 service 共享）。
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use std::ops::Deref;
 use worker::d1::D1Database;
-// worker 0.8.6 **不**在顶层 re-export `JsValue`（只 re-export `js_sys` 模块），
-// 故走 `worker::js_sys::JsValue`（即 wasm-bindgen 的 JsValue）。
-use worker::js_sys::JsValue;
+// worker 0.8.6 不在顶层 re-export `JsValue`；`worker` 顶层 re-export 了 `wasm_bindgen`，
+// 故走 `worker::wasm_bindgen::JsValue`（`worker::js_sys::JsValue` 在 0.8.6 不可用）。
+use worker::wasm_bindgen::JsValue;
 use std::sync::Arc;
 use vtc_core::domain::{
     Announcement, AuditLog, DlcEntry, DlcReport, DlcState, Event, Member, RefreshToken, SaveFile,
@@ -29,11 +31,11 @@ fn str_to_dt(s: &str) -> AppResult<DateTime<Utc>> {
         .map(|t| t.with_timezone(&Utc))
         .map_err(|_| AppError::Internal(anyhow::anyhow!("时间解析失败：{s}")))
 }
-fn dt_req(s: &str) -> DateTime<Utc> {
-    str_to_dt(s).unwrap_or_else(|_| Utc::now())
+fn dt_req<T: AsRef<str>>(s: T) -> DateTime<Utc> {
+    str_to_dt(s.as_ref()).unwrap_or_else(|_| Utc::now())
 }
-fn dt_opt(s: &str) -> Option<DateTime<Utc>> {
-    str_to_dt(s).ok()
+fn dt_opt<T: AsRef<str>>(s: T) -> Option<DateTime<Utc>> {
+    str_to_dt(s.as_ref()).ok()
 }
 
 fn err(e: impl std::fmt::Display) -> AppError {
@@ -48,6 +50,23 @@ enum Arg {
     F64(f64),
     Text(String),
     Null,
+}
+
+/// D1 后端句柄：包 `Arc<D1Database>`（orphan rule 下 `Db` 必须实现在本地类型上）。
+#[derive(Clone)]
+pub struct D1Db(pub Arc<D1Database>);
+
+impl D1Db {
+    pub fn new(d1: D1Database) -> Self {
+        D1Db(Arc::new(d1))
+    }
+}
+
+impl Deref for D1Db {
+    type Target = D1Database;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 trait ArgConv {
@@ -87,38 +106,46 @@ async fn exec(db: &D1Database, sql: &str, args: Vec<Arg>) -> AppResult<()> {
     Ok(())
 }
 
-/// 取全部行的 JsValue（按列位置）
-async fn raw_rows(db: &D1Database, sql: &str, args: Vec<Arg>) -> AppResult<Vec<Vec<JsValue>>> {
+/// 取全部行的 JsValue（按列位置）。
+/// 0.8.6 的 `D1PreparedStatement::raw_js_value()` 返回**扁平** `Vec<JsValue>`
+/// （每 cell 一项，而非按行嵌套），故这里按 `cols` 重新分组为按行的结构。
+/// 注意：`raw<T>()` 要求 `T: Deserialize`，而 `JsValue` 不满足，故用 `raw_js_value()`。
+async fn raw_rows(db: &D1Database, sql: &str, args: Vec<Arg>, cols: usize) -> AppResult<Vec<Vec<JsValue>>> {
     let st = db.prepare(sql).bind(&to_js(&args)).map_err(err)?;
-    st.raw::<JsValue>().await.map_err(err)
+    let cells = st.raw_js_value().await.map_err(err)?;
+    Ok(cells
+        .chunks_exact(cols)
+        .map(|row| row.to_vec())
+        .collect())
 }
 
-/// COUNT(*) 取单个标量
+/// 从 JsValue 提取 i64（D1 的 raw 数值一律是 JS number = f64）
+fn js_to_i64(v: &JsValue) -> Option<i64> {
+    v.as_f64().map(|f| f as i64)
+}
+
+/// COUNT(*) 取单个标量（1 列 × 1 行）
 async fn count_row(db: &D1Database, sql: &str, args: Vec<Arg>) -> AppResult<i64> {
-    let rows = raw_rows(db, sql, args).await?;
-    let v = rows.first().and_then(|r| r.first()).cloned();
-    Ok(v.and_then(|v| v.as_f64().map(|f| f as i64)
-        .or_else(|| v.as_i64())
-        .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok())))
-        .unwrap_or(0))
+    let st = db.prepare(sql).bind(&to_js(&args)).map_err(err)?;
+    let v = st.raw_js_value().await.map_err(err)?;
+    Ok(v.first().and_then(js_to_i64).unwrap_or(0))
 }
 
 // ---------- domain 映射（行 = 按列位置的 JsValue 数组） ----------
 
-fn jstr(a: &[JsValue], i: usize) -> &str {
+fn jstr(a: &[JsValue], i: usize) -> String {
     a.get(i).and_then(|v| v.as_string()).unwrap_or_default()
 }
 fn jopt(a: &[JsValue], i: usize) -> Option<String> {
     a.get(i).and_then(|v| v.as_string()).map(String::from)
 }
 fn jnum(a: &[JsValue], i: usize) -> i64 {
-    a.get(i).and_then(|v| v.as_f64().map(|f| f as i64)
-        .or_else(|| v.as_i64())).unwrap_or(0)
+    a.get(i).and_then(|v| js_to_i64(v)).unwrap_or(0)
 }
 fn jbool(a: &[JsValue], i: usize) -> bool {
-    a.get(i).and_then(|v| v.as_f64().map(|f| f != 0.0)
-        .or_else(|| v.as_i64().map(|n| n != 0))
-        .or_else(|| v.as_bool())).unwrap_or(false)
+    a.get(i)
+        .and_then(|v| js_to_i64(v).map(|n| n != 0).or_else(|| v.as_bool().map(|b| b)))
+        .unwrap_or(false)
 }
 
 fn user_from_row(a: &[JsValue]) -> User {
@@ -253,12 +280,12 @@ fn team_from_row(a: &[JsValue]) -> Team {
 }
 
 #[async_trait(?Send)]
-impl vtc_core::backend::Db for Arc<D1Database> {
+impl vtc_core::backend::Db for D1Db {
     // ---------- 用户 ----------
     async fn get_user_by_username(&self, username: &str) -> AppResult<Option<User>> {
         let sql = "SELECT id,username,pass_hash,role,status,tmp_player_id,steam_id,last_login,created_at FROM \"user\" WHERE username=?";
-        let rows = raw_rows(self, sql, vec![Arg::Text(username.into())]).await?;
-        Ok(rows.into_iter().next().map(user_from_row))
+        let rows = raw_rows(self, sql, vec![Arg::Text(username.into())], 9).await?;
+        Ok(rows.first().map(|r| r.as_slice()).map(user_from_row))
     }
 
     async fn insert_user(&self, u: &User) -> AppResult<()> {
@@ -279,8 +306,8 @@ impl vtc_core::backend::Db for Arc<D1Database> {
 
     async fn get_user_by_id(&self, id: &str) -> AppResult<Option<User>> {
         let sql = "SELECT id,username,pass_hash,role,status,tmp_player_id,steam_id,last_login,created_at FROM \"user\" WHERE id=?";
-        let rows = raw_rows(self, sql, vec![Arg::Text(id.into())]).await?;
-        Ok(rows.into_iter().next().map(user_from_row))
+        let rows = raw_rows(self, sql, vec![Arg::Text(id.into())], 9).await?;
+        Ok(rows.first().map(|r| r.as_slice()).map(user_from_row))
     }
 
     // ---------- 刷新令牌 ----------
@@ -298,8 +325,8 @@ impl vtc_core::backend::Db for Arc<D1Database> {
 
     async fn get_refresh_token(&self, token_hash: &str) -> AppResult<Option<RefreshToken>> {
         let sql = "SELECT id,token_hash,user_id,expires_at,revoked_at,replaced_by,created_at FROM refresh_token WHERE token_hash=?";
-        let rows = raw_rows(self, sql, vec![Arg::Text(token_hash.into())]).await?;
-        Ok(rows.into_iter().next().map(refresh_from_row))
+        let rows = raw_rows(self, sql, vec![Arg::Text(token_hash.into())], 7).await?;
+        Ok(rows.first().map(|r| r.as_slice()).map(refresh_from_row))
     }
 
     async fn revoke_refresh_token(&self, token_hash: &str, replaced_by: Option<&str>) -> AppResult<()> {
@@ -324,27 +351,27 @@ impl vtc_core::backend::Db for Arc<D1Database> {
                 "SELECT m.id,m.user_id,m.role,m.status,m.plate,m.vehicle,m.\"level\",m.points,m.joined_at,m.note
                  FROM member m JOIN \"user\" u ON m.user_id=u.id
                  WHERE u.username LIKE ? ORDER BY m.joined_at DESC LIMIT ? OFFSET ?",
-                vec![like, Arg::Num(take), Arg::Num(skip)]).await?;
-            Ok((rows.into_iter().map(member_from_row).collect(), total))
+                vec![like, Arg::Num(take), Arg::Num(skip)], 10).await?;
+            Ok((rows.iter().map(|r| r.as_slice()).map(member_from_row).collect(), total))
         } else {
             let total = count_row(self, "SELECT COUNT(*) FROM member", vec![]).await?;
             let rows = raw_rows(self,
                 "SELECT id,user_id,role,status,plate,vehicle,\"level\",points,joined_at,note FROM member ORDER BY joined_at DESC LIMIT ? OFFSET ?",
-                vec![Arg::Num(take), Arg::Num(skip)]).await?;
-            Ok((rows.into_iter().map(member_from_row).collect(), total))
+                vec![Arg::Num(take), Arg::Num(skip)], 10).await?;
+            Ok((rows.iter().map(|r| r.as_slice()).map(member_from_row).collect(), total))
         }
     }
 
     async fn get_member_by_user(&self, user_id: &str) -> AppResult<Option<Member>> {
         let sql = "SELECT id,user_id,role,status,plate,vehicle,\"level\",points,joined_at,note FROM member WHERE user_id=?";
-        let rows = raw_rows(self, sql, vec![Arg::Text(user_id.into())]).await?;
-        Ok(rows.into_iter().next().map(member_from_row))
+        let rows = raw_rows(self, sql, vec![Arg::Text(user_id.into())], 10).await?;
+        Ok(rows.first().map(|r| r.as_slice()).map(member_from_row))
     }
 
     async fn get_member_by_id(&self, id: &str) -> AppResult<Option<Member>> {
         let sql = "SELECT id,user_id,role,status,plate,vehicle,\"level\",points,joined_at,note FROM member WHERE id=?";
-        let rows = raw_rows(self, sql, vec![Arg::Text(id.into())]).await?;
-        Ok(rows.into_iter().next().map(member_from_row))
+        let rows = raw_rows(self, sql, vec![Arg::Text(id.into())], 10).await?;
+        Ok(rows.first().map(|r| r.as_slice()).map(member_from_row))
     }
 
     async fn insert_member(&self, m: &Member) -> AppResult<()> {
@@ -388,8 +415,8 @@ impl vtc_core::backend::Db for Arc<D1Database> {
 
     async fn get_save_by_id(&self, id: &str) -> AppResult<Option<SaveFile>> {
         let sql = "SELECT id,game,game_version,label,storage_key,size,sha256,published,downloads,created_at,created_by FROM save_file WHERE id=?";
-        let rows = raw_rows(self, sql, vec![Arg::Text(id.into())]).await?;
-        Ok(rows.into_iter().next().map(save_from_row))
+        let rows = raw_rows(self, sql, vec![Arg::Text(id.into())], 11).await?;
+        Ok(rows.first().map(|r| r.as_slice()).map(save_from_row))
     }
 
     async fn list_saves(&self, game: Option<&str>, version_major: Option<&str>, take: i64, skip: i64) -> AppResult<(Vec<SaveFile>, i64)> {
@@ -402,8 +429,8 @@ impl vtc_core::backend::Db for Arc<D1Database> {
         qargs.push(Arg::Num(take)); qargs.push(Arg::Num(skip));
         let rows = raw_rows(self,
             &format!("SELECT id,game,game_version,label,storage_key,size,sha256,published,downloads,created_at,created_by
-                      FROM save_file WHERE {where_clause} ORDER BY created_at DESC LIMIT ? OFFSET ?"), qargs).await?;
-        Ok((rows.into_iter().map(save_from_row).collect(), total))
+                      FROM save_file WHERE {where_clause} ORDER BY created_at DESC LIMIT ? OFFSET ?"), qargs, 11).await?;
+        Ok((rows.iter().map(|r| r.as_slice()).map(save_from_row).collect(), total))
     }
 
     async fn set_save_published(&self, id: &str, published: bool) -> AppResult<()> {
@@ -415,7 +442,7 @@ impl vtc_core::backend::Db for Arc<D1Database> {
     }
 
     async fn delete_save(&self, id: &str) -> AppResult<()> {
-        exec(self, "DELETE FROM save_file WHERE id=?", vec![Arg::Text(id.clone())]).await?;
+        exec(self, "DELETE FROM save_file WHERE id=?", vec![Arg::Text(id.into())]).await?;
         exec(self, "DELETE FROM save_release WHERE save_id=?", vec![Arg::Text(id.into())]).await
     }
 
@@ -444,8 +471,8 @@ impl vtc_core::backend::Db for Arc<D1Database> {
 
     async fn list_dlc_required(&self, game: &str, major: &str) -> AppResult<Vec<DlcEntry>> {
         let sql = "SELECT id,game,major,dlc_id,display_name,is_map,required,purchase_url FROM dlc_entry WHERE game=? AND major=?";
-        let rows = raw_rows(self, sql, vec![Arg::Text(game.into()), Arg::Text(major.into())]).await?;
-        Ok(rows.into_iter().map(|a| DlcEntry {
+        let rows = raw_rows(self, sql, vec![Arg::Text(game.into()), Arg::Text(major.into())], 8).await?;
+        Ok(rows.iter().map(|r| r.as_slice()).map(|a| DlcEntry {
             id: jstr(&a, 0).into(),
             game: jstr(&a, 1).into(),
             major: jstr(&a, 2).into(),
@@ -484,8 +511,8 @@ impl vtc_core::backend::Db for Arc<D1Database> {
 
     async fn get_dlc_state_by_member(&self, member_id: &str) -> AppResult<Option<DlcState>> {
         let sql = "SELECT id,member_id,event_disabled,disabled_list,snapshot_path,snapshot_at,restored_at FROM dlc_state WHERE member_id=?";
-        let rows = raw_rows(self, sql, vec![Arg::Text(member_id.into())]).await?;
-        Ok(rows.into_iter().next().map(dlc_state_from_row))
+        let rows = raw_rows(self, sql, vec![Arg::Text(member_id.into())], 7).await?;
+        Ok(rows.first().map(|r| r.as_slice()).map(dlc_state_from_row))
     }
 
     // ---------- 公告 ----------
@@ -504,8 +531,8 @@ impl vtc_core::backend::Db for Arc<D1Database> {
 
     async fn get_announcement(&self, id: &str) -> AppResult<Option<Announcement>> {
         let sql = "SELECT id,title,body,status,published_at,scheduled_at,pinned,author_id,created_at,updated_at FROM announcement WHERE id=?";
-        let rows = raw_rows(self, sql, vec![Arg::Text(id.into())]).await?;
-        Ok(rows.into_iter().next().map(ann_from_row))
+        let rows = raw_rows(self, sql, vec![Arg::Text(id.into())], 10).await?;
+        Ok(rows.first().map(|r| r.as_slice()).map(ann_from_row))
     }
 
     async fn list_announcements(&self, status_: Option<&str>, take: i64, skip: i64) -> AppResult<(Vec<Announcement>, i64)> {
@@ -517,8 +544,8 @@ impl vtc_core::backend::Db for Arc<D1Database> {
         let rows = raw_rows(self,
             &format!("SELECT id,title,body,status,published_at,scheduled_at,pinned,author_id,created_at,updated_at
                       FROM announcement WHERE {where_clause}
-                      ORDER BY (pinned DESC), published_at DESC LIMIT ? OFFSET ?"), args).await?;
-        Ok((rows.into_iter().map(ann_from_row).collect(), total))
+                      ORDER BY (pinned DESC), published_at DESC LIMIT ? OFFSET ?"), args, 10).await?;
+        Ok((rows.iter().map(|r| r.as_slice()).map(ann_from_row).collect(), total))
     }
 
     async fn update_announcement(&self, a: &Announcement) -> AppResult<()> {
@@ -553,8 +580,8 @@ impl vtc_core::backend::Db for Arc<D1Database> {
 
     async fn get_event(&self, id: &str) -> AppResult<Option<Event>> {
         let sql = "SELECT id,name,etype,activity_at,depart_at,server,navigation,image_key,save_id,status,requires_map_dlc,created_by FROM \"event\" WHERE id=?";
-        let rows = raw_rows(self, sql, vec![Arg::Text(id.into())]).await?;
-        Ok(rows.into_iter().next().map(event_from_row))
+        let rows = raw_rows(self, sql, vec![Arg::Text(id.into())], 12).await?;
+        Ok(rows.first().map(|r| r.as_slice()).map(event_from_row))
     }
 
     async fn list_events(&self, status_: Option<&str>, take: i64, skip: i64) -> AppResult<(Vec<Event>, i64)> {
@@ -565,8 +592,8 @@ impl vtc_core::backend::Db for Arc<D1Database> {
         args.push(Arg::Num(take)); args.push(Arg::Num(skip));
         let rows = raw_rows(self,
             &format!("SELECT id,name,etype,activity_at,depart_at,server,navigation,image_key,save_id,status,requires_map_dlc,created_by
-                      FROM \"event\" WHERE {where_clause} ORDER BY activity_at DESC LIMIT ? OFFSET ?"), args).await?;
-        Ok((rows.into_iter().map(event_from_row).collect(), total))
+                      FROM \"event\" WHERE {where_clause} ORDER BY activity_at DESC LIMIT ? OFFSET ?"), args, 12).await?;
+        Ok((rows.iter().map(|r| r.as_slice()).map(event_from_row).collect(), total))
     }
 
     async fn update_event(&self, e: &Event) -> AppResult<()> {
@@ -604,16 +631,16 @@ impl vtc_core::backend::Db for Arc<D1Database> {
         args.push(Arg::Num(take)); args.push(Arg::Num(skip));
         let rows = raw_rows(self,
             &format!("SELECT id,actor,action,target,ip,detail,at FROM audit_log WHERE {where_clause} ORDER BY at DESC LIMIT ? OFFSET ?"),
-            args).await?;
-        Ok((rows.into_iter().map(audit_from_row).collect(), total))
+            args, 7).await?;
+        Ok((rows.iter().map(|r| r.as_slice()).map(audit_from_row).collect(), total))
     }
 
     // ---------- Team ----------
     async fn get_team(&self) -> AppResult<Option<Team>> {
         let sql = "SELECT id,name,slogan,slug,logo,login_bg,login_layout,accent_color,default_lang,
                   feature_allow_upload,feature_tmp_binding,feature_rss_enabled,created_at FROM team LIMIT 1";
-        let rows = raw_rows(self, sql, vec![]).await?;
-        Ok(rows.into_iter().next().map(team_from_row))
+        let rows = raw_rows(self, sql, vec![], 13).await?;
+        Ok(rows.first().map(|r| r.as_slice()).map(team_from_row))
     }
 
     async fn upsert_team(&self, t: &Team) -> AppResult<()> {

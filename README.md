@@ -49,11 +49,12 @@ docker compose -f docker/docker-compose.yml up -d
 
 ### Cloudflare Workers 形态
 
+完整步骤（建 D1/R2 → 填 wrangler.jsonc → 上传 DLC 模板到 R2 → 构建 → deploy → 验证）
+见下方 **[Cloudflare Workers 部署](#cloudflare-workers-部署)**。最短路径：
+
 ```bash
 cd crates/vtc-worker
-cargo build --target wasm32-wasip2 --release   # 产物供 wrangler 用
-wrangler d1 migrations apply DB
-wrangler secret put JWT_SECRET
+cargo build --target wasm32-wasip2 --release   # 产物：vtc_worker.wasm（release 约 22 MB）
 wrangler deploy
 ```
 
@@ -64,7 +65,7 @@ wrangler deploy
 - 地图 DLC 模板文件（`map-dlc/1.61.ets2.txt` 10 条 / `ats` 20 条）复用。
 - 种子：admin / `ChangeMe123!`（`ADMIN_INITIAL_PASSWORD` 覆盖）、默认车队。
 
-## 双目标 async 边界（P1 已解决）
+## 双目标 async 边界（架构核心，已落地）
 
 Docker/axum 的 `Handler` 要求 future 是 **Send**；Cloudflare worker 的 D1/R2 绑定是
 `Rc`/`Arc<D1Database>`（**非 Send**，wasm 单线程）。二者无法共享同一套 `Arc<dyn Db>`。
@@ -85,12 +86,100 @@ service 代码两种 feature 下**完全相同**——这是"一份代码双编�
 - **S3/PostgreSQL**：Docker 默认 SQLite + 本地存储；S3/PG 是 P1（接口已留）。
 - **C 依赖规避**：手写 JWT/PBKDF2（不拉 jsonwebtoken/pbkdf2 → 避免 ring C 编译）；
   SQLite 用预编译库（不 bundled）。这是为适应无 C 编译器环境的工程取舍，生产可换回 bundled。
-  - **P0 交付**：Docker 自部署形态（编译绿 + 运行时全链路冒烟通过：health/config/login/members/dlc=10/401）。
-  - **P1 适配**：让 service 对后端**泛型**（`<D: Db>` 而非 `Arc<dyn Db>`），即可让同一份 service
-    在 Docker（Send 具体类型）与 worker（`?Send` 的 `Rc<D1/R2>`）下分别成立。worker 的 D1 `db.rs` /
-    R2 `storage.rs` 源码已就位（`crates/vtc-worker/src/`），wrangler.jsonc + D1 migrations 已配好，
-    只差这个泛型化改造即可上 CF。
+
+## Cloudflare Workers 部署
+
+worker 形态**零 C 依赖**（D1/R2 走 CF 托管，无 SQLite、无本地存储），`cargo build` 直接出 wasm，
+不需要 Docker 形态那套预编译 SQLite。**一条代码、一套服务逻辑**，与 Docker 完全共享。
+
+### 前置：本地资源（一次性）
+
+在 `crates/vtc-worker/` 下执行（需 `wrangler`，`npm i -g wrangler` 或 `npm i -g wrangler@3`）：
+
+```bash
+cd crates/vtc-worker
+
+# 1) 创建 D1（= SQLite 方言的关系型数据库；返回 database_id）
+wrangler d1 create vtc
+#    → 把返回的 database_id 填进 wrangler.jsonc 的 bindings[DB].database_id
+
+# 2) 创建 R2 桶（对象存储：存档 + DLC 模板都放这）
+wrangler r2 bucket create vtc-saves
+
+# 3) 应用 D1 建表迁移（13 张表）
+wrangler d1 migrations apply DB
+```
+
+### 填 wrangler.jsonc
+
+- `bindings[DB].database_id`：上一步 `wrangler d1 create` 的值。
+- `bindings[BUCKET].bucket_name`：R2 桶名（`vtc-saves`）。
+- `routes[].zone_id`：你的 Cloudflare zone id（`wrangler whoami` 可查）；自定义域名场景填
+  `/api/*` 与 `/storage/*` 两条路由（worker 同时服务两类路径，见 `src/lib.rs` 路由分发）。
+- `vars`：非机密配置（`TEAM_NAME` / `UPDATE_CHANNEL` / `PUBLIC_BASE` / `AUTH_REQUIRE_TMP` …）。
+  **`JWT_SECRET` 不写 vars**，用 secret：
+
+```bash
+wrangler secret put JWT_SECRET          # 生产必须 ≥32 字符
+wrangler secret put VTC_STORAGE_SIGN_KEY # 存储中转 HMAC 签名密钥
+```
+
+### 上传 DLC 模板到 R2
+
+worker 无文件系统，DLC 地图模板（`map-dlc/1.61.ets2.txt` 等）改存 **R2 的 `dlc-templates/` 前缀**
+（`/dlc/map-template` 与 `/dlc/disable` 从这里读）。把上层 `map-dlc/` 的模板文件批量上传：
+
+```bash
+# ETS2 1.61（10 条）
+wrangler r2 object put dlc-templates/1.61.ets2.txt --file <上层>/map-dlc/1.61.ets2.txt
+# ATS 1.61（20 条）
+wrangler r2 object put dlc-templates/1.61.ats.txt  --file <上层>/map-dlc/1.61.ats.txt
+```
+
+> 客户端按 `<major>.<game>.txt` 取模板；加新游戏版本时把对应模板 `put` 到 `dlc-templates/` 即可，
+> 无需改 worker 代码。
+
+### 构建 + 部署
+
+```bash
+cd crates/vtc-worker
+# 产物：target/wasm32-wasip2/release/vtc_worker.wasm（release 约 22 MB，CF 限额内）
+cargo build --target wasm32-wasip2 --release
+wrangler deploy
+#    → https://vtc-server.<你的子域>.workers.dev
+```
+
+### 验证（部署后）
+
+```bash
+B=<你的 workers.dev 域名>
+curl $B/api/v1/health                        # ok
+curl $B/api/v1/config/public                 # 车队品牌（无鉴权）
+curl $B/api/v1/dlc/map-template?game=ets2&major=1.61   # R2 模板（10 条）
+# 登录拿 token（admin / ChangeMe123!，可用 wrangler secret put 改 ADMIN_INITIAL_PASSWORD）
+curl -X POST $B/api/v1/auth/login -H 'content-type: application/json' \
+     -d '{"username":"admin","password":"ChangeMe123!"}'
+# 带 Bearer 调管理端点（/members /saves /audit …）
+```
+
+### 形态对照（同一份 service，两种后端）
+
+| 关注点 | Docker 形态（`vtc-server`） | CF Workers 形态（`vtc-worker`） |
+|---|---|---|
+| 数据库 | SQLite（`rusqlite`，本地文件 `vtc.db`） | **D1**（CF 托管，`db::D1Db` 实现 `Db`） |
+| 对象存储 | 本地磁盘（`LocalStorage`） | **R2**（`R2Storage`；预签名 URL → worker 中转 HMAC 签名） |
+| DLC 模板 | 本地 `map-dlc/*.txt` 文件 | **R2 `dlc-templates/*.txt`**（`parse_template` 解析） |
+| 推送 | 内存 `InMemPush`（存根） | Durable Objects 骨架（存根） |
+| 路由 | Axum（`{id}` 模板） | `match (path, method)` 段解析（无 axum） |
+| async | `#[async_trait]`（Send） | `#[async_trait(?Send)]`（wasm 单线程） |
+| 部署 | `docker compose up` | `wrangler deploy` |
 
 ## 状态
 
-见交付汇报：Docker 形态已验证；worker 形态为 P1 适配（基础设施已就绪）。
+- **P0 全量 API**：Docker 形态编译绿 + 运行时全链路冒烟通过（health/config/public/login/members CRUD/
+  saves 上传凭证+发布+下载凭证+取消+删除/announcements CRUD/events CRUD/dlc map-template+required+
+  report+disable+restore/audit 列表+过滤/存储中转 PUT+GET/401 鉴权边界）。
+- **Cloudflare Workers 形态**：编译绿（`vtc_worker.wasm` 22 MB），P0 全量路由与 Docker 同源
+  （共享 vtc-core service），D1/R2 模板源就位，`wrangler deploy` 即可上 CF。
+- **遗留（P1）**：WebSocket 真实推送（Durable Objects）、S3/PostgreSQL 后端、D1 建表的
+  `start`/`scheduled` 事件接入（P0 用 `wrangler d1 migrations apply` 手动建表）。

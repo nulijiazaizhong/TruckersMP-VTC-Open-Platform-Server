@@ -7,6 +7,7 @@ pub mod member;
 pub mod save;
 pub mod dlc;
 pub mod content;
+pub mod audit;
 pub mod rate;
 
 pub use config::ConfigService;
@@ -15,4 +16,5 @@ pub use member::MemberService;
 pub use save::SaveService;
 pub use dlc::DlcService;
 pub use content::ContentService;
+pub use audit::AuditService;
 pub use rate::RateLimiter;

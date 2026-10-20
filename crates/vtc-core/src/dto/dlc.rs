@@ -31,7 +31,7 @@ pub struct DlcReportDto {
 fn default_game() -> String { "ets2".into() }
 
 /// DLC 禁用请求
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct DlcDisableReq {
     #[serde(default = "default_game")]
@@ -42,6 +42,16 @@ pub struct DlcDisableReq {
     pub requires_map_dlc: Option<String>,
 }
 fn default_major() -> String { "1.61".into() }
+
+/// DLC 还原请求（POST /dlc/restore，客户端还原后上报）
+#[derive(Serialize, Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DlcRestoreDto {
+    #[serde(default = "default_game")]
+    pub game: String,
+    #[serde(default)]
+    pub restored: Vec<String>,
+}
 
 /// 禁用计划（响应，客户端据此执行 move）
 #[derive(Serialize, Clone)]

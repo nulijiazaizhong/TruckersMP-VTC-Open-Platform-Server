@@ -23,7 +23,7 @@ pub struct SaveFileDto {
 }
 
 /// 上传凭证请求（管理）
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SaveUploadReq {
     #[serde(default = "default_game")]

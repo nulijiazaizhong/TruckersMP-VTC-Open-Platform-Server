@@ -7,6 +7,7 @@ pub mod member;
 pub mod save;
 pub mod dlc;
 pub mod content;
+pub mod audit;
 
 use serde::{Deserialize, Serialize};
 

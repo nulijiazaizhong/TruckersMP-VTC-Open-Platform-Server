@@ -16,25 +16,41 @@ pub struct DlcService<D: Db> {
     pub template_dir: String,
 }
 
+/// 从**任意来源的模板文本**解析出行数组（纯函数，无文件系统/后端依赖 →
+/// worker 可从 R2/DB 读出文本后直接解析，local 读本地文件后解析）。
+/// 行 = 每行 trim、去空行、去 `#` 注释行。
+pub fn parse_template(content: &str) -> DlcMapTemplate {
+    content
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.to_string())
+        .collect()
+}
+
 impl<D: Db> DlcService<D> {
     pub fn new(db: Arc<D>, template_dir: String) -> Self {
         DlcService { db, template_dir }
     }
 
-    /// 加载某大版本+游戏的地图类文件名清单（行数组）
+    /// 加载某大版本+游戏的地图类文件名清单（行数组）。
+    /// **读本地文件**（Docker/local 形态）；worker 形态无文件系统，改走 `map_template_from`（由
+    /// 路由层从 R2/DB 读出模板文本后传入）。
     pub fn load_template(&self, major: &str, gamename: &str) -> AppResult<DlcMapTemplate> {
         let path = Path::new(&self.template_dir).join(format!("{major}.{gamename}.txt"));
         let content = std::fs::read_to_string(&path)
             .map_err(|_| AppError::NotFound(format!("地图 DLC 模板缺失：{}（请放 {}）", path.display(), self.template_dir)))?;
-        Ok(content
-            .lines()
-            .map(|l| l.trim())
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .map(|l| l.to_string())
-            .collect())
+        Ok(parse_template(&content))
     }
 
-    /// 地图类文件名清单（GET /dlc/map-template?game&major）
+    /// 地图类文件名清单（GET /dlc/map-template?game&major）。
+    /// `source` = 模板文本（local 形态由路由 `load_template` 读文件后传入；worker 由 R2/DB 读出）。
+    /// 这样核心逻辑不碰文件系统，双形态都能用。
+    pub fn map_template_from(&self, source: &str) -> AppResult<DlcMapTemplate> {
+        Ok(parse_template(source))
+    }
+
+    /// 地图类文件名清单（GET /dlc/map-template?game&major）· local 便利重载。
     pub fn map_template(&self, gamename: &str, major: &str) -> AppResult<DlcMapTemplate> {
         self.load_template(major, gamename)
     }
@@ -67,10 +83,22 @@ impl<D: Db> DlcService<D> {
         self.db.insert_dlc_report(&rep).await
     }
 
-    /// 生成禁用计划（POST /dlc/disable）
-    /// 读模板 → 过滤豁免包（requires_map_dlc）→ 返回 to_disable + keep
+    /// 生成禁用计划（POST /dlc/disable）· local 重载（读本地模板文件）。
     pub async fn plan_disable(&self, actor: &str, ip: &str, req: &DlcDisableReq) -> AppResult<DlcDisablePlan> {
         let template = self.load_template(&req.version, &req.game)?;
+        self.plan_disable_from(template, actor, ip, req).await
+    }
+
+    /// 生成禁用计划（POST /dlc/disable）· 从**模板行数组**出发（无文件系统依赖）。
+    /// local 形态 `plan_disable` 读文件得到 `template` 后走这里；worker 从 R2/DB 读出文本、
+    /// `parse_template` 得到 `template` 后走这里。核心逻辑不碰文件系统，双形态都能用。
+    pub async fn plan_disable_from(
+        &self,
+        template: Vec<String>,
+        actor: &str,
+        ip: &str,
+        req: &DlcDisableReq,
+    ) -> AppResult<DlcDisablePlan> {
         // 豁免包：活动 requires_map_dlc（逗号分隔 → 小写集合）
         let exempt: std::collections::HashSet<String> = req
             .requires_map_dlc

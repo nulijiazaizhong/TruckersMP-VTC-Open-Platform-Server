@@ -26,6 +26,16 @@ const wasm = await WebAssembly.instantiate(
   fetch("vtc_worker.wasm", { env: self }).then((r) => r.arrayBuffer()),
 );
 
-// 2) 导出入口。worker-rs 的 #[worker::event(fetch)] 宏保证导出 `fetch`（3 参数：
-//    raw Request, Env, Context），CF 直接路由到它。`scheduled` 未注册则无此导出。
-export { fetch } from wasm.instance;
+// 2) 导出入口。worker-rs 的 #[worker::event(fetch)] 宏保证 wasm 实例导出名为 `fetch`
+//    的函数（3 参数：raw Request, Env, Context），CF 直接路由到它。`scheduled` 未注册则无。
+//
+// ★ 写法注意（两处都踩过坑）：
+//   a) 不能用 `export { fetch } from wasm.instance;` —— wrangler 的 esbuild 不支持
+//      「从动态成员（wasm.instance）re-export」，会报 `Expected string but found "wasm"`。
+//   b) 不能直接 `export const fetch = wasm.instance.fetch;` —— `fetch` 是 lexical 顶层声明，
+//      会在整个模块作用域**遮蔽全局 `globalThis.fetch`**，而上面第 1 步 `fetch("vtc_worker.wasm")`
+//      正需要全局 fetch，会触发 TDZ ReferenceError。
+//   所以：先取到本地变量 `__vtc_fetch`（不叫 fetch，不遮蔽全局），再 `export { … as fetch }`
+//   以 `fetch` 为名 re-export —— 纯静态 `export { local as name }`，esbuild 完全支持。
+const __vtc_fetch = wasm.instance.fetch;
+export { __vtc_fetch as fetch };

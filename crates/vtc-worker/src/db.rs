@@ -47,6 +47,8 @@ fn err(e: impl std::fmt::Display) -> AppError {
 #[derive(Clone)]
 enum Arg {
     Num(i64),
+    /// P1 浮点参数（评分/比例类字段）启用后使用；P0 占位
+    #[allow(dead_code)]
     F64(f64),
     Text(String),
     Null,

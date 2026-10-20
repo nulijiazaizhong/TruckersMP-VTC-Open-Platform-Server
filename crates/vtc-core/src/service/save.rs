@@ -2,7 +2,7 @@
 //! 大文件走预签名 URL，不落库、不走 API 中转（§3.5）
 
 use crate::backend::{Db, Storage};
-use crate::constants::{audit, status};
+use crate::constants::audit;
 use crate::domain::{SaveFile, SaveRelease};
 use crate::dto::save::{
     PublishReq, SaveCredentialDto, SaveDownloadCredentialDto, SaveDownloadReq, SaveFileDto, SaveUploadReq,

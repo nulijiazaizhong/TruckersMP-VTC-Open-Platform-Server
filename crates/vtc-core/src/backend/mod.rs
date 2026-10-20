@@ -10,7 +10,6 @@
 //! service 层代码两种 feature 下**完全相同**（泛型 `D: Db`，不持 `Arc<dyn Db>`）。
 
 use crate::domain::*;
-use crate::dto::*;
 use crate::error::AppResult;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

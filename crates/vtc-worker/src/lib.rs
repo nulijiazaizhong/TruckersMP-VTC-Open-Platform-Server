@@ -120,7 +120,9 @@ fn parse_qs<T: serde::de::DeserializeOwned + Default>(q: &str) -> T {
 struct StorageQs {
     #[serde(default)]
     key: String,
+    /// HMAC 签名（P1 存储中转鉴权启用后校验；P0 占位，保持 query 契约）
     #[serde(default)]
+    #[allow(dead_code)]
     sig: String,
 }
 

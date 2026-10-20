@@ -9,7 +9,7 @@ pub mod dlc;
 pub mod content;
 pub mod audit;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 /// 分页结果（对齐 VTC.Shared.PageResult<T>）
 #[derive(Serialize)]

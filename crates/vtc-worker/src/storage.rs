@@ -53,10 +53,13 @@ impl R2Storage {
         Ok(key.to_string())
     }
 
+    /// P1 直传/列表对象用；P0 经 `local_access` 中转，此处占位
+    #[allow(dead_code)]
     pub fn bucket(&self) -> &Bucket {
         &self.bucket
     }
-    /// 拿一个可跨调用共享的 `Rc<Bucket>`（worker 路由中转用）
+    /// P1 跨调用共享 `Rc<Bucket>`（worker 路由中转用）；P0 占位
+    #[allow(dead_code)]
     pub fn bucket_ref(&self) -> Rc<Bucket> {
         Rc::clone(&self.bucket)
     }

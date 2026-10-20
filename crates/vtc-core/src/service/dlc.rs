@@ -3,7 +3,7 @@
 
 use crate::backend::Db;
 use crate::constants::{audit, game};
-use crate::domain::{DlcEntry, DlcReport, DlcState};
+use crate::domain::DlcReport;
 use crate::dto::dlc::{DlcDisablePlan, DlcDisableReq, DlcMapTemplate, DlcRequiredDto};
 use crate::error::{AppError, AppResult};
 use std::path::Path;

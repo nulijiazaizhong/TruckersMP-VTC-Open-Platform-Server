@@ -215,7 +215,14 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response, Er
             };
         }
         ("/auth/login", Method::Post) => {
-            let body: dto::auth::AuthLoginDto = req.json().await.unwrap_or_default();
+            // ★ 用 req.text() + serde_json::from_str（不用 req.json()）：req.json() 内部走
+            // serde_wasm_bindgen::from_value，在 wasm 下对非对象 JsValue 可能 panic
+            // （outcome:exception，CF 1101）。text() 只取字符串，from_str 错误走 Err 不 panic。
+            let body: dto::auth::AuthLoginDto =
+                match req.text().await {
+                    Ok(t) => serde_json::from_str(&t).unwrap_or_default(),
+                    Err(_) => dto::auth::AuthLoginDto::default(),
+                };
             let auth = AuthService::new(
                 db.clone(),
                 jwt.clone(),
@@ -229,7 +236,12 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response, Er
             };
         }
         ("/auth/refresh", Method::Post) => {
-            let body: dto::auth::AuthRefreshDto = req.json().await.unwrap_or_default();
+            let body: dto::auth::AuthRefreshDto = match req.text().await {
+                Ok(t) => serde_json::from_str(&t).unwrap_or(dto::auth::AuthRefreshDto {
+                    refresh_token: String::new(),
+                }),
+                Err(_) => dto::auth::AuthRefreshDto { refresh_token: String::new() },
+            };
             let auth = AuthService::new(db, jwt, rate, cfg.require_tmp, cfg.require_steam);
             return match auth.refresh(&body.refresh_token, "127.0.0.1").await {
                 Ok(v) => ok_json(&v),

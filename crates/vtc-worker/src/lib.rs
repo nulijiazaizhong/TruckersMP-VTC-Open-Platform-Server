@@ -244,13 +244,12 @@ async fn fetch_inner(mut req: Request, env: Env, _ctx: Context) -> Result<Respon
             };
         }
         ("/auth/login", Method::Post) => {
-            // ★ req.text() + serde_json::from_str（不用 req.json() 的 from_value）。
-            // ★ **不**用 console_log 做诊断：CF worker 的 console（web_sys::console）在
-            // wasm 单线程热路径**连续**同步调用会**挂起**（CF 判定 hang 取消请求，
-            // "Worker's code had hung"）——前两条侥幸过、第三条卡死。诊断改走 response。
-            // ★ 用 worker-rs 原生 req.json 解析 body：req.text 在 wasm 边界对 POST body
-            // 的读取可能抛异常（→ __wbg_new / hang），req.json 是 worker-rs 内部稳定的 body 路径。
-            // 解析失败回 default（空 username → 400 用户名或密码错误，而非 500 崩溃）。
+            // ★ 二分探针：login 分支先**什么都不做**，直接返回固定 200 JSON。
+            //   若此固定响应成功 → 崩溃在 login 后续（auth_service/D1/…）；
+            //   若仍 __wbg_new/hang → 崩溃在共享前置（ensure_ready/worker_services/…）或更底层。
+            // 定位后移除本行、恢复下方真实逻辑。
+            return ok_json(&serde_json::json!({"probe":"login-branch","ok":true}));
+            #[allow(unreachable_code)]
             let body: dto::auth::AuthLoginDto = req.json().await.unwrap_or_default();
             let auth = AuthService::new(
                 db.clone(),

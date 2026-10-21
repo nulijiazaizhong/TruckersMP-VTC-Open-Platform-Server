@@ -9,6 +9,8 @@ pub mod dlc;
 pub mod content;
 pub mod audit;
 pub mod rate;
+// P1
+pub mod p1;
 
 pub use config::ConfigService;
 pub use auth_service::AuthService;
@@ -18,3 +20,5 @@ pub use dlc::DlcService;
 pub use content::ContentService;
 pub use audit::AuditService;
 pub use rate::RateLimiter;
+// P1
+pub use p1::{PointsService, RssService, StatsService, ThreeCService};

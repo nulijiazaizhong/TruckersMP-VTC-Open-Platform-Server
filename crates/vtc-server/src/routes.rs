@@ -24,7 +24,8 @@ use vtc_core::constants::{game, role, status};
 use vtc_core::dto;
 use vtc_core::error::AppError;
 use vtc_core::service::{
-    AuditService, AuthService, ConfigService, ContentService, DlcService, MemberService, SaveService,
+    AuditService, AuthService, ConfigService, ContentService, DlcService, MemberService, PointsService,
+    RssService, SaveService, StatsService, ThreeCService,
 };
 use crate::bootstrap::ServerConfig;
 use crate::db::SqliteDb;
@@ -117,6 +118,10 @@ pub fn build_app(
         .route("/dlc/report", post(dlc_report))
         .route("/dlc/disable", post(dlc_disable))
         .route("/dlc/restore", post(dlc_restore))
+        // 活动记录（C7，成员以上）
+        .route("/event-logs", get(list_event_logs).post(create_event_log))
+        // 排行榜（C11，无鉴权——公开展示）
+        .route("/leaderboard", get(get_leaderboard))
         // 管理（Admin/Manager）
         .route("/members", get(list_members).post(create_member))
         .route("/members/{id}", get(get_member).patch(patch_member).delete(delete_member))
@@ -127,7 +132,16 @@ pub fn build_app(
         .route("/announcements", post(create_announcement))
         .route("/announcements/{id}", patch(patch_announcement).delete(delete_announcement))
         .route("/events", post(create_event))
-        .route("/events/{id}", patch(patch_event).delete(delete_event));
+        .route("/events/{id}", patch(patch_event).delete(delete_event))
+        // P1: 积分规则（Admin 设/读）
+        .route("/points/rules", get(p1_get_rule).post(p1_set_rule))
+        // P1: 统计看板（Admin）
+        .route("/stats/summary", get(p1_stats_summary))
+        // P1: 3C 资源
+        .route("/3c/upload-credential", post(p1_3c_upload))
+        .route("/3c/{name}/download", get(p1_3c_download))
+        // P1: RSS 资讯（公开）
+        .route("/rss", get(p1_rss_list));
 
     let storage = Router::new()
         .route("/storage/upload", post(storage_upload).put(storage_upload))
@@ -466,6 +480,145 @@ fn require_admin(claims: &Claims) -> Result<(), AppError> {
         Ok(())
     } else {
         Err(AppError::Forbidden("需要 Admin/Manager 角色".into()))
+    }
+}
+
+// ---------- P1：活动记录 + 排行榜 ----------
+
+async fn list_event_logs(State(s): State<AppState>, AuthUser(c): AuthUser, Query(q): Query<Qs>) -> impl IntoResponse {
+    // 按当前用户对应的 member 过滤
+    use vtc_core::backend::Db;
+    let member = match s.db.get_member_by_user(&c.sub).await {
+        Ok(m) => m,
+        Err(e) => return err_response(&e),
+    };
+    let Some(member) = member else { return err_response(&AppError::NotFound("未找到成员记录".into())) };
+    let (logs, total) = match s.db.list_event_logs(Some(&member.id), q.take, q.skip).await {
+        Ok(v) => v,
+        Err(e) => return err_response(&e),
+    };
+    // 填充 event_name（JOIN 活动表）
+    let mut dtos = Vec::with_capacity(logs.len());
+    for l in &logs {
+        let evt_name = s.db.get_event(&l.event_id).await.ok()
+            .flatten().map(|e| e.name);
+        dtos.push(dto::events_log::EventLogDto {
+            id: l.id.clone(),
+            member_id: l.member_id.clone(),
+            event_id: l.event_id.clone(),
+            event_name: evt_name,
+            result: l.result.clone(),
+            mileage: l.mileage,
+            income: l.income,
+            at: l.at,
+        });
+    }
+    Json(dto::PageResult { items: dtos, total, page: q.page, page_size: q.take }).into_response()
+}
+
+async fn create_event_log(State(s): State<AppState>, AuthUser(c): AuthUser, Json(body): Json<dto::events_log::EventLogCreateDto>) -> impl IntoResponse {
+    use vtc_core::backend::Db;
+    let member = match s.db.get_member_by_user(&c.sub).await {
+        Ok(m) => m,
+        Err(e) => return err_response(&e),
+    };
+    let Some(member) = member else { return err_response(&AppError::NotFound("未找到成员记录".into())) };
+    let log = vtc_core::domain::EventLog {
+        id: uuid::Uuid::new_v4().to_string(),
+        member_id: member.id.clone(),
+        event_id: body.event_id.clone(),
+        result: body.result.clone(),
+        mileage: body.mileage,
+        income: body.income,
+        at: chrono::Utc::now(),
+    };
+    if let Err(e) = s.db.insert_event_log(&log).await {
+        return err_response(&e);
+    }
+    let dto_out = dto::events_log::EventLogDto {
+        id: log.id.clone(),
+        member_id: log.member_id.clone(),
+        event_id: log.event_id.clone(),
+        event_name: None,
+        result: log.result.clone(),
+        mileage: log.mileage,
+        income: log.income,
+        at: log.at,
+    };
+    (StatusCode::CREATED, Json(dto_out)).into_response()
+}
+
+async fn get_leaderboard(State(s): State<AppState>, Query(q): Query<Qs>) -> impl IntoResponse {
+    use vtc_core::backend::Db;
+    let (rows, total) = match s.db.list_leaderboard(q.take, q.skip).await {
+        Ok(v) => v,
+        Err(e) => return err_response(&e),
+    };
+    let mut entries = Vec::with_capacity(rows.len());
+    for (i, (member_id, user_id, plate, points)) in rows.iter().enumerate() {
+        let username = s.db.get_user_by_id(user_id).await.ok()
+            .flatten().map(|u| u.username).unwrap_or_default();
+        entries.push(dto::events_log::LeaderboardEntryDto {
+            rank: (i as i64) + 1,
+            member_id: member_id.clone(),
+            username,
+            plate: plate.clone(),
+            points: *points,
+        });
+    }
+    Json(dto::events_log::LeaderboardDto { items: entries, total }).into_response()
+}
+
+// ---------- P1 处理器 ----------
+
+async fn p1_get_rule(State(s): State<AppState>, AuthUser(c): AuthUser, Query(q): Query<Qs>) -> impl IntoResponse {
+    let pts = PointsService::new(s.db.clone());
+    match pts.get_rule("event_complete", "global").await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => err_response(&e),
+    }
+}
+
+async fn p1_set_rule(State(s): State<AppState>, AuthUser(c): AuthUser, Json(body): Json<dto::points::PointsRuleSetDto>) -> impl IntoResponse {
+    if let Err(e) = require_admin(&c) { return err_response(&e); }
+    let pts = PointsService::new(s.db.clone());
+    match pts.set_rule(&body).await {
+        Ok(v) => (StatusCode::CREATED, Json(v)).into_response(),
+        Err(e) => err_response(&e),
+    }
+}
+
+async fn p1_stats_summary(State(s): State<AppState>, AuthUser(c): AuthUser) -> impl IntoResponse {
+    if let Err(e) = require_admin(&c) { return err_response(&e); }
+    let stats = StatsService::new(s.db.clone());
+    match stats.summary().await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => err_response(&e),
+    }
+}
+
+async fn p1_3c_upload(State(s): State<AppState>, AuthUser(c): AuthUser, Json(body): Json<dto::threec::ThreeCUploadReq>) -> impl IntoResponse {
+    if let Err(e) = require_admin(&c) { return err_response(&e); }
+    let svc = ThreeCService::new(s.db.clone(), s.storage.clone());
+    match svc.issue_upload(&body).await {
+        Ok(v) => (StatusCode::CREATED, Json(v)).into_response(),
+        Err(e) => err_response(&e),
+    }
+}
+
+async fn p1_3c_download(State(s): State<AppState>, Path(name): Path<String>) -> impl IntoResponse {
+    let svc = ThreeCService::new(s.db.clone(), s.storage.clone());
+    match svc.download(&name).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => err_response(&e),
+    }
+}
+
+async fn p1_rss_list(State(s): State<AppState>, Query(q): Query<Qs>) -> impl IntoResponse {
+    let svc = RssService::new(s.db.clone());
+    match svc.list(q.game.as_deref(), q.major.as_deref(), q.take, q.skip).await {
+        Ok((items, total)) => Json(dto::PageResult { items, total, page: q.page, page_size: q.take }).into_response(),
+        Err(e) => err_response(&e),
     }
 }
 

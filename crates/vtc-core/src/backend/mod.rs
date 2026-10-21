@@ -62,12 +62,34 @@ pub trait Db {
     async fn list_events(&self, status: Option<&str>, take: i64, skip: i64) -> AppResult<(Vec<Event>, i64)>;
     async fn update_event(&self, e: &Event) -> AppResult<()>;
     async fn delete_event(&self, id: &str) -> AppResult<()>;
+    // 活动记录（C7）
+    async fn list_event_logs(&self, member_id: Option<&str>, take: i64, skip: i64) -> AppResult<(Vec<EventLog>, i64)>;
+    async fn insert_event_log(&self, e: &EventLog) -> AppResult<()>;
+    // 排行榜（C11）
+    async fn list_leaderboard(&self, take: i64, skip: i64) -> AppResult<(Vec<(String, String, Option<String>, i64)>, i64)>;
     // 审计
     async fn insert_audit(&self, a: &AuditLog) -> AppResult<()>;
     async fn list_audit(&self, action: Option<&str>, take: i64, skip: i64) -> AppResult<(Vec<AuditLog>, i64)>;
     // Team（单队）
     async fn get_team(&self) -> AppResult<Option<Team>>;
     async fn upsert_team(&self, t: &Team) -> AppResult<()>;
+    // P1: 积分
+    async fn get_points_rule(&self, trigger: &str, scope: &str) -> AppResult<Option<PointsRule>>;
+    async fn upsert_points_rule(&self, r: &PointsRule) -> AppResult<()>;
+    async fn bump_member_points(&self, member_id: &str, delta: i64) -> AppResult<()>;
+    // P1: 统计
+    async fn count_members(&self) -> AppResult<i64>;
+    async fn count_active_members(&self) -> AppResult<i64>;
+    async fn count_saves(&self) -> AppResult<i64>;
+    async fn count_total_downloads(&self) -> AppResult<i64>;
+    async fn count_events(&self) -> AppResult<i64>;
+    async fn count_active_events(&self) -> AppResult<i64>;
+    async fn count_announcements(&self) -> AppResult<i64>;
+    async fn count_downloads_since(&self, days: i64) -> AppResult<i64>;
+    async fn count_logins_since(&self, days: i64) -> AppResult<i64>;
+    // P1: RSS
+    async fn list_scs_posts(&self, source: Option<&str>, game_version: Option<&str>, take: i64, skip: i64) -> AppResult<(Vec<ScsPost>, i64)>;
+    async fn upsert_scs_post(&self, p: &ScsPost) -> AppResult<()>;
 }
 
 // ---------- Db（Cloudflare worker：?Send 孪生，签名与上完全一致） ----------
@@ -111,10 +133,30 @@ pub trait Db {
     async fn list_events(&self, status: Option<&str>, take: i64, skip: i64) -> AppResult<(Vec<Event>, i64)>;
     async fn update_event(&self, e: &Event) -> AppResult<()>;
     async fn delete_event(&self, id: &str) -> AppResult<()>;
+    async fn list_event_logs(&self, member_id: Option<&str>, take: i64, skip: i64) -> AppResult<(Vec<EventLog>, i64)>;
+    async fn insert_event_log(&self, e: &EventLog) -> AppResult<()>;
+    async fn list_leaderboard(&self, take: i64, skip: i64) -> AppResult<(Vec<(String, String, Option<String>, i64)>, i64)>;
     async fn insert_audit(&self, a: &AuditLog) -> AppResult<()>;
     async fn list_audit(&self, action: Option<&str>, take: i64, skip: i64) -> AppResult<(Vec<AuditLog>, i64)>;
     async fn get_team(&self) -> AppResult<Option<Team>>;
     async fn upsert_team(&self, t: &Team) -> AppResult<()>;
+    // P1: 积分
+    async fn get_points_rule(&self, trigger: &str, scope: &str) -> AppResult<Option<PointsRule>>;
+    async fn upsert_points_rule(&self, r: &PointsRule) -> AppResult<()>;
+    async fn bump_member_points(&self, member_id: &str, delta: i64) -> AppResult<()>;
+    // P1: 统计
+    async fn count_members(&self) -> AppResult<i64>;
+    async fn count_active_members(&self) -> AppResult<i64>;
+    async fn count_saves(&self) -> AppResult<i64>;
+    async fn count_total_downloads(&self) -> AppResult<i64>;
+    async fn count_events(&self) -> AppResult<i64>;
+    async fn count_active_events(&self) -> AppResult<i64>;
+    async fn count_announcements(&self) -> AppResult<i64>;
+    async fn count_downloads_since(&self, days: i64) -> AppResult<i64>;
+    async fn count_logins_since(&self, days: i64) -> AppResult<i64>;
+    // P1: RSS
+    async fn list_scs_posts(&self, source: Option<&str>, game_version: Option<&str>, take: i64, skip: i64) -> AppResult<(Vec<ScsPost>, i64)>;
+    async fn upsert_scs_post(&self, p: &ScsPost) -> AppResult<()>;
 }
 
 /// 共享 Db 句柄（service 层已泛型，此处保留兼容）

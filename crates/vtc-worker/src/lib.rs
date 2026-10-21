@@ -402,6 +402,69 @@ async fn fetch_inner(mut req: Request, env: Env, _ctx: Context) -> Result<Respon
         };
     }
 
+    // P1：活动记录（C7，成员以上）
+    if path == "/event-logs" && method == Method::Get {
+        let qs = parse_qs::<Qs>(&query);
+        let member = match db.get_member_by_user(&actor).await.ok().flatten() {
+            Some(m) => m,
+            None => return err_json(&AppError::NotFound("未找到成员记录".into())),
+        };
+        let (logs, total) = match db.list_event_logs(Some(&member.id), qs.take, qs.skip).await {
+            Ok(v) => v,
+            Err(e) => return err_json(&e),
+        };
+        let mut dtos = Vec::with_capacity(logs.len());
+        for l in &logs {
+            let evt_name = db.get_event(&l.event_id).await.ok().flatten().map(|e| e.name);
+            dtos.push(dto::events_log::EventLogDto {
+                id: l.id.clone(), member_id: l.member_id.clone(), event_id: l.event_id.clone(),
+                event_name: evt_name, result: l.result.clone(),
+                mileage: l.mileage, income: l.income, at: l.at,
+            });
+        }
+        return ok_json(&dto::PageResult { items: dtos, total, page: qs.page, page_size: qs.take });
+    }
+    if path == "/event-logs" && method == Method::Post {
+        let body: dto::events_log::EventLogCreateDto = req.json().await.unwrap_or_default();
+        let member = match db.get_member_by_user(&actor).await.ok().flatten() {
+            Some(m) => m,
+            None => return err_json(&AppError::NotFound("未找到成员记录".into())),
+        };
+        let log = vtc_core::domain::EventLog {
+            id: uuid::Uuid::new_v4().to_string(),
+            member_id: member.id.clone(), event_id: body.event_id.clone(),
+            result: body.result.clone(), mileage: body.mileage, income: body.income,
+            at: chrono::Utc::now(),
+        };
+        if let Err(e) = db.insert_event_log(&log).await { return err_json(&e); }
+        let out = dto::events_log::EventLogDto {
+            id: log.id.clone(), member_id: log.member_id.clone(), event_id: log.event_id.clone(),
+            event_name: None, result: log.result.clone(),
+            mileage: log.mileage, income: log.income, at: log.at,
+        };
+        return json_status(201, &out);
+    }
+
+    // P1：排行榜（C11，无鉴权）
+    if path == "/leaderboard" && method == Method::Get {
+        let qs = parse_qs::<Qs>(&query);
+        let (rows, total) = match db.list_leaderboard(qs.take, qs.skip).await {
+            Ok(v) => v,
+            Err(e) => return err_json(&e),
+        };
+        let mut entries = Vec::with_capacity(rows.len());
+        for (i, (member_id, user_id, plate, points)) in rows.iter().enumerate() {
+            let username = db.get_user_by_id(user_id).await.ok()
+                .flatten().map(|u| u.username).unwrap_or_default();
+            entries.push(dto::events_log::LeaderboardEntryDto {
+                rank: (i as i64) + 1,
+                member_id: member_id.clone(), username,
+                plate: plate.clone(), points: *points,
+            });
+        }
+        return ok_json(&dto::events_log::LeaderboardDto { items: entries, total });
+    }
+
     // DLC 成员以上
     if path == "/dlc/report" && method == Method::Post {
         let body: dto::dlc::DlcReportDto = req.json().await.unwrap_or_default();

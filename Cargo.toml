@@ -32,7 +32,9 @@ hmac = "0.12"
 # 该特性内部 `#[cfg(target_arch="wasm32")]` 门控，Docker/native 构建**完全不受影响**。
 chrono = { version = "0.4", features = ["serde", "wasmbind"] }
 time = { version = "0.3", features = ["serde", "macros"] }
-uuid = { version = "1", features = ["serde", "v4"] }
+uuid = { version = "1", features = ["serde", "v4", "js"] }
+# wasm32: getrandom 需 wasm_js（rand 0.9 用 0.3，uuid 用 0.4，两个都要）
+getrandom = { version = "0.3", features = ["wasm_js"] }
 
 # --- 持久化（Docker 形态） ---
 # bundled=true：libsqlite3-sys 自带 SQLite C 源码，用 cc-rs 现场编译，**不**依赖系统 libsqlite3。

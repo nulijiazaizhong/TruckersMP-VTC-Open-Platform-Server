@@ -8,6 +8,11 @@ pub mod save;
 pub mod dlc;
 pub mod content;
 pub mod audit;
+pub mod events_log;
+// P1
+pub mod points;
+pub mod rss;
+pub mod threec;
 
 use serde::Serialize;
 

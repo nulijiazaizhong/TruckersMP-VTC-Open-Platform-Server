@@ -187,6 +187,48 @@ pub struct Event {
     pub created_by: Option<String>,
 }
 
+/// 活动记录（C7：个人参赛/跑线/交付记录）
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct EventLog {
+    pub id: String,
+    pub member_id: String,
+    pub event_id: String,
+    pub result: String,
+    pub mileage: Option<i64>,
+    pub income: Option<i64>,
+    pub at: DateTime<Utc>,
+}
+
+/// 积分规则（S10：简单记分表，trigger + points + scope）
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PointsRule {
+    pub id: String,
+    /// 触发器：event_complete（参加活动）
+    pub trigger: String,
+    pub points: i64,
+    /// scope: "global" 或具体活动 id
+    pub scope: String,
+}
+
+/// SCS RSS 缓存条目（S9：资讯聚合）
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ScsPost {
+    pub id: String,
+    /// 源：ets2 / ats / scs_blog
+    pub source: String,
+    pub title: String,
+    pub url: String,
+    pub date: DateTime<Utc>,
+    /// JSON 数组字符串（标签）
+    pub tags: String,
+    /// 游戏版本标签（如 1.61）
+    pub game_version_tag: Option<String>,
+    pub fetched_at: DateTime<Utc>,
+}
+
 /// 审计日志
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]

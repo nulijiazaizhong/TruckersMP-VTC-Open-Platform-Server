@@ -17,8 +17,8 @@ use worker::d1::{D1Database, D1PreparedStatement};
 use worker::wasm_bindgen::JsValue;
 use std::sync::Arc;
 use vtc_core::domain::{
-    Announcement, AuditLog, DlcEntry, DlcReport, DlcState, Event, Member, RefreshToken, SaveFile,
-    SaveRelease, Team, User,
+    Announcement, AuditLog, DlcEntry, DlcReport, DlcState, Event, EventLog, Member, PointsRule,
+    RefreshToken, SaveFile, SaveRelease, ScsPost, Team, User,
 };
 use vtc_core::error::{AppError, AppResult};
 
@@ -116,7 +116,7 @@ impl D1Db {
     /// **不改** `insert_user`（member 注册等场景需保留「用户名已存在→报 Conflict」语义）。
     /// 固有方法（**非** Db trait），seed_admin（lib.rs）直接 `db.upsert_admin_user(..)` 调。
     pub async fn upsert_admin_user(&self, u: &vtc_core::domain::User) -> AppResult<()> {
-        exec(self,
+        exec(&self.0,
             "INSERT INTO \"user\" (id,username,pass_hash,role,status,tmp_player_id,steam_id,last_login,created_at)
              VALUES (?,?,?,?,?,?,?,?,?)
              ON CONFLICT(username) DO UPDATE SET
@@ -128,6 +128,18 @@ impl D1Db {
                 u.last_login.as_ref().map(dt_to_str).into_arg(),
                 Arg::Text(dt_to_str(&u.created_at)),
             ]).await
+    }
+
+    /// P1 统计辅助：无参 COUNT
+    async fn scalar_count(&self, sql: &str) -> AppResult<i64> {
+        let rows = raw_rows(&self.0, sql, vec![], 1).await?;
+        Ok(rows.first().and_then(|r| r.first().and_then(|v| v.as_f64())).unwrap_or(0.0) as i64)
+    }
+
+    /// P1 统计辅助：单参数 COUNT
+    async fn scalar_count_param(&self, sql: &str, param: &str) -> AppResult<i64> {
+        let rows = raw_rows(&self.0, sql, vec![Arg::Text(param.to_string())], 1).await?;
+        Ok(rows.first().and_then(|r| r.first().and_then(|v| v.as_f64())).unwrap_or(0.0) as i64)
     }
 }
 
@@ -211,6 +223,21 @@ async fn raw_rows(db: &D1Database, sql: &str, args: Vec<Arg>, _cols: usize) -> A
 /// 从 JsValue 提取 i64（D1 的 raw 数值一律是 JS number = f64）
 fn js_to_i64(v: &JsValue) -> Option<i64> {
     v.as_f64().map(|f| f as i64)
+}
+
+/// 从 JsValue 提取 String
+fn js_str(v: &JsValue) -> String {
+    v.as_string().unwrap_or_default()
+}
+
+/// 从 JsValue 提取 Option<String>
+fn js_opt_str(v: &JsValue) -> Option<String> {
+    if v.is_undefined() || v.is_null() { None } else { v.as_string() }
+}
+
+/// 从 JsValue 提取 Option<i64>
+fn js_opt_i64(v: &JsValue) -> Option<i64> {
+    if v.is_undefined() || v.is_null() { None } else { v.as_f64().map(|f| f as i64) }
 }
 
 /// COUNT(*) 取单个标量（1 列 × 1 行）
@@ -400,7 +427,7 @@ impl vtc_core::backend::Db for D1Db {
     }
 
     async fn insert_user(&self, u: &User) -> AppResult<()> {
-        exec(self,
+        exec(&self.0,
             "INSERT INTO \"user\" (id,username,pass_hash,role,status,tmp_player_id,steam_id,last_login,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
             vec![
                 Arg::Text(u.id.clone()), Arg::Text(u.username.clone()), Arg::Text(u.pass_hash.clone()),
@@ -412,18 +439,18 @@ impl vtc_core::backend::Db for D1Db {
     }
 
     async fn update_user_last_login(&self, id: &str, at: DateTime<Utc>) -> AppResult<()> {
-        exec(self, "UPDATE \"user\" SET last_login=? WHERE id=?", vec![Arg::Text(dt_to_str(&at)), Arg::Text(id.into())]).await
+        exec(&self.0, "UPDATE \"user\" SET last_login=? WHERE id=?", vec![Arg::Text(dt_to_str(&at)), Arg::Text(id.into())]).await
     }
 
     async fn get_user_by_id(&self, id: &str) -> AppResult<Option<User>> {
         let sql = "SELECT id,username,pass_hash,role,status,tmp_player_id,steam_id,last_login,created_at FROM \"user\" WHERE id=?";
-        let rows = raw_rows(self, sql, vec![Arg::Text(id.into())], 9).await?;
+        let rows = raw_rows(&self.0, sql, vec![Arg::Text(id.into())], 9).await?;
         Ok(rows.first().map(|r| r.as_slice()).map(user_from_row))
     }
 
     // ---------- 刷新令牌 ----------
     async fn insert_refresh_token(&self, t: &RefreshToken) -> AppResult<()> {
-        exec(self,
+        exec(&self.0,
             "INSERT INTO refresh_token (id,token_hash,user_id,expires_at,revoked_at,replaced_by,created_at) VALUES (?,?,?,?,?,?,?)",
             vec![
                 Arg::Text(t.id.clone()), Arg::Text(t.token_hash.clone()), Arg::Text(t.user_id.clone()),
@@ -436,18 +463,18 @@ impl vtc_core::backend::Db for D1Db {
 
     async fn get_refresh_token(&self, token_hash: &str) -> AppResult<Option<RefreshToken>> {
         let sql = "SELECT id,token_hash,user_id,expires_at,revoked_at,replaced_by,created_at FROM refresh_token WHERE token_hash=?";
-        let rows = raw_rows(self, sql, vec![Arg::Text(token_hash.into())], 7).await?;
+        let rows = raw_rows(&self.0, sql, vec![Arg::Text(token_hash.into())], 7).await?;
         Ok(rows.first().map(|r| r.as_slice()).map(refresh_from_row))
     }
 
     async fn revoke_refresh_token(&self, token_hash: &str, replaced_by: Option<&str>) -> AppResult<()> {
-        exec(self,
+        exec(&self.0,
             "UPDATE refresh_token SET revoked_at=?, replaced_by=? WHERE token_hash=? AND revoked_at IS NULL",
             vec![Arg::Text(dt_to_str(&Utc::now())), replaced_by.map(String::from).into_arg(), Arg::Text(token_hash.into())]).await
     }
 
     async fn revoke_all_for_user(&self, user_id: &str) -> AppResult<()> {
-        exec(self, "UPDATE refresh_token SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",
+        exec(&self.0, "UPDATE refresh_token SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",
             vec![Arg::Text(dt_to_str(&Utc::now())), Arg::Text(user_id.into())]).await
     }
 
@@ -455,18 +482,18 @@ impl vtc_core::backend::Db for D1Db {
     async fn list_members(&self, take: i64, skip: i64, search: Option<&str>) -> AppResult<(Vec<Member>, i64)> {
         if let Some(q) = search {
             let like = Arg::Text(format!("%{q}%"));
-            let total = count_row(self,
+            let total = count_row(&self.0,
                 "SELECT COUNT(*) FROM member m JOIN \"user\" u ON m.user_id=u.id WHERE u.username LIKE ?",
                 vec![like.clone()]).await?;
-            let rows = raw_rows(self,
+            let rows = raw_rows(&self.0,
                 "SELECT m.id,m.user_id,m.role,m.status,m.plate,m.vehicle,m.\"level\",m.points,m.joined_at,m.note
                  FROM member m JOIN \"user\" u ON m.user_id=u.id
                  WHERE u.username LIKE ? ORDER BY m.joined_at DESC LIMIT ? OFFSET ?",
                 vec![like, Arg::Num(take), Arg::Num(skip)], 10).await?;
             Ok((rows.iter().map(|r| r.as_slice()).map(member_from_row).collect(), total))
         } else {
-            let total = count_row(self, "SELECT COUNT(*) FROM member", vec![]).await?;
-            let rows = raw_rows(self,
+            let total = count_row(&self.0, "SELECT COUNT(*) FROM member", vec![]).await?;
+            let rows = raw_rows(&self.0,
                 "SELECT id,user_id,role,status,plate,vehicle,\"level\",points,joined_at,note FROM member ORDER BY joined_at DESC LIMIT ? OFFSET ?",
                 vec![Arg::Num(take), Arg::Num(skip)], 10).await?;
             Ok((rows.iter().map(|r| r.as_slice()).map(member_from_row).collect(), total))
@@ -475,18 +502,18 @@ impl vtc_core::backend::Db for D1Db {
 
     async fn get_member_by_user(&self, user_id: &str) -> AppResult<Option<Member>> {
         let sql = "SELECT id,user_id,role,status,plate,vehicle,\"level\",points,joined_at,note FROM member WHERE user_id=?";
-        let rows = raw_rows(self, sql, vec![Arg::Text(user_id.into())], 10).await?;
+        let rows = raw_rows(&self.0, sql, vec![Arg::Text(user_id.into())], 10).await?;
         Ok(rows.first().map(|r| r.as_slice()).map(member_from_row))
     }
 
     async fn get_member_by_id(&self, id: &str) -> AppResult<Option<Member>> {
         let sql = "SELECT id,user_id,role,status,plate,vehicle,\"level\",points,joined_at,note FROM member WHERE id=?";
-        let rows = raw_rows(self, sql, vec![Arg::Text(id.into())], 10).await?;
+        let rows = raw_rows(&self.0, sql, vec![Arg::Text(id.into())], 10).await?;
         Ok(rows.first().map(|r| r.as_slice()).map(member_from_row))
     }
 
     async fn insert_member(&self, m: &Member) -> AppResult<()> {
-        exec(self,
+        exec(&self.0,
             "INSERT INTO member (id,user_id,role,status,plate,vehicle,\"level\",points,joined_at,note) VALUES (?,?,?,?,?,?,?,?,?,?)",
             vec![
                 Arg::Text(m.id.clone()), Arg::Text(m.user_id.clone()), Arg::Text(m.role.clone()),
@@ -497,7 +524,7 @@ impl vtc_core::backend::Db for D1Db {
     }
 
     async fn update_member(&self, m: &Member) -> AppResult<()> {
-        exec(self,
+        exec(&self.0,
             "UPDATE member SET role=?,status=?,plate=?,vehicle=?,\"level\"=?,points=?,note=? WHERE id=?",
             vec![
                 Arg::Text(m.role.clone()), Arg::Text(m.status.clone()),
@@ -508,12 +535,12 @@ impl vtc_core::backend::Db for D1Db {
     }
 
     async fn set_member_status(&self, id: &str, status: &str) -> AppResult<()> {
-        exec(self, "UPDATE member SET status=? WHERE id=?", vec![Arg::Text(status.into()), Arg::Text(id.into())]).await
+        exec(&self.0, "UPDATE member SET status=? WHERE id=?", vec![Arg::Text(status.into()), Arg::Text(id.into())]).await
     }
 
     // ---------- 存档 ----------
     async fn insert_save(&self, s: &SaveFile) -> AppResult<()> {
-        exec(self,
+        exec(&self.0,
             "INSERT INTO save_file (id,game,game_version,label,storage_key,size,sha256,published,downloads,created_at,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             vec![
                 Arg::Text(s.id.clone()), Arg::Text(s.game.clone()), Arg::Text(s.game_version.clone()),
@@ -526,7 +553,7 @@ impl vtc_core::backend::Db for D1Db {
 
     async fn get_save_by_id(&self, id: &str) -> AppResult<Option<SaveFile>> {
         let sql = "SELECT id,game,game_version,label,storage_key,size,sha256,published,downloads,created_at,created_by FROM save_file WHERE id=?";
-        let rows = raw_rows(self, sql, vec![Arg::Text(id.into())], 11).await?;
+        let rows = raw_rows(&self.0, sql, vec![Arg::Text(id.into())], 11).await?;
         Ok(rows.first().map(|r| r.as_slice()).map(save_from_row))
     }
 
@@ -535,30 +562,30 @@ impl vtc_core::backend::Db for D1Db {
         let mut args: Vec<Arg> = Vec::new();
         if let Some(g) = game { where_clause.push_str(" AND game=?"); args.push(Arg::Text(g.into())); }
         if let Some(v) = version_major { where_clause.push_str(" AND game_version LIKE ?"); args.push(Arg::Text(format!("{v}%"))); }
-        let total = count_row(self, &format!("SELECT COUNT(*) FROM save_file WHERE {where_clause}"), args.clone()).await?;
+        let total = count_row(&self.0, &format!("SELECT COUNT(*) FROM save_file WHERE {where_clause}"), args.clone()).await?;
         let mut qargs = args.clone();
         qargs.push(Arg::Num(take)); qargs.push(Arg::Num(skip));
-        let rows = raw_rows(self,
+        let rows = raw_rows(&self.0,
             &format!("SELECT id,game,game_version,label,storage_key,size,sha256,published,downloads,created_at,created_by
                       FROM save_file WHERE {where_clause} ORDER BY created_at DESC LIMIT ? OFFSET ?"), qargs, 11).await?;
         Ok((rows.iter().map(|r| r.as_slice()).map(save_from_row).collect(), total))
     }
 
     async fn set_save_published(&self, id: &str, published: bool) -> AppResult<()> {
-        exec(self, "UPDATE save_file SET published=? WHERE id=?", vec![Arg::Num(published as i64), Arg::Text(id.into())]).await
+        exec(&self.0, "UPDATE save_file SET published=? WHERE id=?", vec![Arg::Num(published as i64), Arg::Text(id.into())]).await
     }
 
     async fn bump_save_downloads(&self, id: &str) -> AppResult<()> {
-        exec(self, "UPDATE save_file SET downloads=downloads+1 WHERE id=?", vec![Arg::Text(id.into())]).await
+        exec(&self.0, "UPDATE save_file SET downloads=downloads+1 WHERE id=?", vec![Arg::Text(id.into())]).await
     }
 
     async fn delete_save(&self, id: &str) -> AppResult<()> {
-        exec(self, "DELETE FROM save_file WHERE id=?", vec![Arg::Text(id.into())]).await?;
-        exec(self, "DELETE FROM save_release WHERE save_id=?", vec![Arg::Text(id.into())]).await
+        exec(&self.0, "DELETE FROM save_file WHERE id=?", vec![Arg::Text(id.into())]).await?;
+        exec(&self.0, "DELETE FROM save_release WHERE save_id=?", vec![Arg::Text(id.into())]).await
     }
 
     async fn insert_save_release(&self, r: &SaveRelease) -> AppResult<()> {
-        exec(self,
+        exec(&self.0,
             "INSERT INTO save_release (id,save_id,release_note,released_at,released_by) VALUES (?,?,?,?,?)",
             vec![
                 Arg::Text(r.id.clone()), Arg::Text(r.save_id.clone()), Arg::Text(r.release_note.clone()),
@@ -568,7 +595,7 @@ impl vtc_core::backend::Db for D1Db {
 
     // ---------- DLC ----------
     async fn upsert_dlc_entry(&self, e: &DlcEntry) -> AppResult<()> {
-        exec(self,
+        exec(&self.0,
             "INSERT INTO dlc_entry (id,game,major,dlc_id,display_name,is_map,required,purchase_url) VALUES (?,?,?,?,?,?,?,?)
              ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name, is_map=excluded.is_map,
              required=excluded.required, purchase_url=excluded.purchase_url",
@@ -582,7 +609,7 @@ impl vtc_core::backend::Db for D1Db {
 
     async fn list_dlc_required(&self, game: &str, major: &str) -> AppResult<Vec<DlcEntry>> {
         let sql = "SELECT id,game,major,dlc_id,display_name,is_map,required,purchase_url FROM dlc_entry WHERE game=? AND major=?";
-        let rows = raw_rows(self, sql, vec![Arg::Text(game.into()), Arg::Text(major.into())], 8).await?;
+        let rows = raw_rows(&self.0, sql, vec![Arg::Text(game.into()), Arg::Text(major.into())], 8).await?;
         Ok(rows.iter().map(|r| r.as_slice()).map(|a| DlcEntry {
             id: jstr(&a, 0).into(),
             game: jstr(&a, 1).into(),
@@ -596,7 +623,7 @@ impl vtc_core::backend::Db for D1Db {
     }
 
     async fn insert_dlc_report(&self, r: &DlcReport) -> AppResult<()> {
-        exec(self,
+        exec(&self.0,
             "INSERT INTO dlc_report (id,member_id,game,missing,installed,reported_at) VALUES (?,?,?,?,?,?)",
             vec![
                 Arg::Text(r.id.clone()), Arg::Text(r.member_id.clone()), Arg::Text(r.game.clone()),
@@ -606,7 +633,7 @@ impl vtc_core::backend::Db for D1Db {
     }
 
     async fn upsert_dlc_state(&self, s: &DlcState) -> AppResult<()> {
-        exec(self,
+        exec(&self.0,
             "INSERT INTO dlc_state (id,member_id,event_disabled,disabled_list,snapshot_path,snapshot_at,restored_at)
              VALUES (?,?,?,?,?,?,?)
              ON CONFLICT(member_id) DO UPDATE SET event_disabled=excluded.event_disabled,
@@ -622,13 +649,13 @@ impl vtc_core::backend::Db for D1Db {
 
     async fn get_dlc_state_by_member(&self, member_id: &str) -> AppResult<Option<DlcState>> {
         let sql = "SELECT id,member_id,event_disabled,disabled_list,snapshot_path,snapshot_at,restored_at FROM dlc_state WHERE member_id=?";
-        let rows = raw_rows(self, sql, vec![Arg::Text(member_id.into())], 7).await?;
+        let rows = raw_rows(&self.0, sql, vec![Arg::Text(member_id.into())], 7).await?;
         Ok(rows.first().map(|r| r.as_slice()).map(dlc_state_from_row))
     }
 
     // ---------- 公告 ----------
     async fn insert_announcement(&self, a: &Announcement) -> AppResult<()> {
-        exec(self,
+        exec(&self.0,
             "INSERT INTO announcement (id,title,body,status,published_at,scheduled_at,pinned,author_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
             vec![
                 Arg::Text(a.id.clone()), Arg::Text(a.title.clone()), Arg::Text(a.body.clone()),
@@ -642,17 +669,17 @@ impl vtc_core::backend::Db for D1Db {
 
     async fn get_announcement(&self, id: &str) -> AppResult<Option<Announcement>> {
         let sql = "SELECT id,title,body,status,published_at,scheduled_at,pinned,author_id,created_at,updated_at FROM announcement WHERE id=?";
-        let rows = raw_rows(self, sql, vec![Arg::Text(id.into())], 10).await?;
+        let rows = raw_rows(&self.0, sql, vec![Arg::Text(id.into())], 10).await?;
         Ok(rows.first().map(|r| r.as_slice()).map(ann_from_row))
     }
 
     async fn list_announcements(&self, status_: Option<&str>, take: i64, skip: i64) -> AppResult<(Vec<Announcement>, i64)> {
         let (where_clause, wargs): (String, Vec<Arg>) =
             if let Some(s) = status_ { (String::from("status=?"), vec![Arg::Text(s.into())]) } else { (String::from("1=1"), vec![]) };
-        let total = count_row(self, &format!("SELECT COUNT(*) FROM announcement WHERE {where_clause}"), wargs.clone()).await?;
+        let total = count_row(&self.0, &format!("SELECT COUNT(*) FROM announcement WHERE {where_clause}"), wargs.clone()).await?;
         let mut args = wargs.clone();
         args.push(Arg::Num(take)); args.push(Arg::Num(skip));
-        let rows = raw_rows(self,
+        let rows = raw_rows(&self.0,
             &format!("SELECT id,title,body,status,published_at,scheduled_at,pinned,author_id,created_at,updated_at
                       FROM announcement WHERE {where_clause}
                       ORDER BY (pinned DESC), published_at DESC LIMIT ? OFFSET ?"), args, 10).await?;
@@ -660,7 +687,7 @@ impl vtc_core::backend::Db for D1Db {
     }
 
     async fn update_announcement(&self, a: &Announcement) -> AppResult<()> {
-        exec(self,
+        exec(&self.0,
             "UPDATE announcement SET title=?,body=?,status=?,published_at=?,scheduled_at=?,pinned=?,updated_at=? WHERE id=?",
             vec![
                 Arg::Text(a.title.clone()), Arg::Text(a.body.clone()), Arg::Text(a.status.clone()),
@@ -671,12 +698,12 @@ impl vtc_core::backend::Db for D1Db {
     }
 
     async fn delete_announcement(&self, id: &str) -> AppResult<()> {
-        exec(self, "DELETE FROM announcement WHERE id=?", vec![Arg::Text(id.into())]).await
+        exec(&self.0, "DELETE FROM announcement WHERE id=?", vec![Arg::Text(id.into())]).await
     }
 
     // ---------- 活动 ----------
     async fn insert_event(&self, e: &Event) -> AppResult<()> {
-        exec(self,
+        exec(&self.0,
             "INSERT INTO \"event\" (id,name,etype,activity_at,depart_at,server,navigation,image_key,save_id,status,requires_map_dlc,created_by)
              VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             vec![
@@ -691,24 +718,24 @@ impl vtc_core::backend::Db for D1Db {
 
     async fn get_event(&self, id: &str) -> AppResult<Option<Event>> {
         let sql = "SELECT id,name,etype,activity_at,depart_at,server,navigation,image_key,save_id,status,requires_map_dlc,created_by FROM \"event\" WHERE id=?";
-        let rows = raw_rows(self, sql, vec![Arg::Text(id.into())], 12).await?;
+        let rows = raw_rows(&self.0, sql, vec![Arg::Text(id.into())], 12).await?;
         Ok(rows.first().map(|r| r.as_slice()).map(event_from_row))
     }
 
     async fn list_events(&self, status_: Option<&str>, take: i64, skip: i64) -> AppResult<(Vec<Event>, i64)> {
         let (where_clause, wargs): (String, Vec<Arg>) =
             if let Some(s) = status_ { (String::from("status=?"), vec![Arg::Text(s.into())]) } else { (String::from("1=1"), vec![]) };
-        let total = count_row(self, &format!("SELECT COUNT(*) FROM \"event\" WHERE {where_clause}"), wargs.clone()).await?;
+        let total = count_row(&self.0, &format!("SELECT COUNT(*) FROM \"event\" WHERE {where_clause}"), wargs.clone()).await?;
         let mut args = wargs.clone();
         args.push(Arg::Num(take)); args.push(Arg::Num(skip));
-        let rows = raw_rows(self,
+        let rows = raw_rows(&self.0,
             &format!("SELECT id,name,etype,activity_at,depart_at,server,navigation,image_key,save_id,status,requires_map_dlc,created_by
                       FROM \"event\" WHERE {where_clause} ORDER BY activity_at DESC LIMIT ? OFFSET ?"), args, 12).await?;
         Ok((rows.iter().map(|r| r.as_slice()).map(event_from_row).collect(), total))
     }
 
     async fn update_event(&self, e: &Event) -> AppResult<()> {
-        exec(self,
+        exec(&self.0,
             "UPDATE \"event\" SET name=?,etype=?,activity_at=?,depart_at=?,server=?,navigation=?,image_key=?,save_id=?,status=?,requires_map_dlc=? WHERE id=?",
             vec![
                 Arg::Text(e.name.clone()), Arg::Text(e.etype.clone()),
@@ -720,12 +747,12 @@ impl vtc_core::backend::Db for D1Db {
     }
 
     async fn delete_event(&self, id: &str) -> AppResult<()> {
-        exec(self, "DELETE FROM \"event\" WHERE id=?", vec![Arg::Text(id.into())]).await
+        exec(&self.0, "DELETE FROM \"event\" WHERE id=?", vec![Arg::Text(id.into())]).await
     }
 
     // ---------- 审计 ----------
     async fn insert_audit(&self, a: &AuditLog) -> AppResult<()> {
-        exec(self,
+        exec(&self.0,
             "INSERT INTO audit_log (id,actor,action,target,ip,detail,at) VALUES (?,?,?,?,?,?,?)",
             vec![
                 Arg::Text(a.id.clone()), Arg::Text(a.actor.clone()), Arg::Text(a.action.clone()),
@@ -737,10 +764,10 @@ impl vtc_core::backend::Db for D1Db {
     async fn list_audit(&self, action: Option<&str>, take: i64, skip: i64) -> AppResult<(Vec<AuditLog>, i64)> {
         let (where_clause, wargs): (String, Vec<Arg>) =
             if let Some(a) = action { (String::from("action=?"), vec![Arg::Text(a.into())]) } else { (String::from("1=1"), vec![]) };
-        let total = count_row(self, &format!("SELECT COUNT(*) FROM audit_log WHERE {where_clause}"), wargs.clone()).await?;
+        let total = count_row(&self.0, &format!("SELECT COUNT(*) FROM audit_log WHERE {where_clause}"), wargs.clone()).await?;
         let mut args = wargs.clone();
         args.push(Arg::Num(take)); args.push(Arg::Num(skip));
-        let rows = raw_rows(self,
+        let rows = raw_rows(&self.0,
             &format!("SELECT id,actor,action,target,ip,detail,at FROM audit_log WHERE {where_clause} ORDER BY at DESC LIMIT ? OFFSET ?"),
             args, 7).await?;
         Ok((rows.iter().map(|r| r.as_slice()).map(audit_from_row).collect(), total))
@@ -750,12 +777,12 @@ impl vtc_core::backend::Db for D1Db {
     async fn get_team(&self) -> AppResult<Option<Team>> {
         let sql = "SELECT id,name,slogan,slug,logo,login_bg,login_layout,accent_color,default_lang,
                   feature_allow_upload,feature_tmp_binding,feature_rss_enabled,created_at FROM team LIMIT 1";
-        let rows = raw_rows(self, sql, vec![], 13).await?;
+        let rows = raw_rows(&self.0, sql, vec![], 13).await?;
         Ok(rows.first().map(|r| r.as_slice()).map(team_from_row))
     }
 
     async fn upsert_team(&self, t: &Team) -> AppResult<()> {
-        exec(self,
+        exec(&self.0,
             "INSERT INTO team (id,name,slogan,slug,logo,login_bg,login_layout,accent_color,default_lang,
              feature_allow_upload,feature_tmp_binding,feature_rss_enabled,created_at)
              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
@@ -770,6 +797,170 @@ impl vtc_core::backend::Db for D1Db {
                 Arg::Num(t.feature_allow_upload as i64), Arg::Num(t.feature_tmp_binding as i64),
                 Arg::Num(t.feature_rss_enabled as i64), Arg::Text(dt_to_str(&t.created_at)),
             ]).await
+    }
+
+    // ---------- EventLog（C7） ----------
+
+    async fn list_event_logs(&self, member_id: Option<&str>, take: i64, skip: i64) -> AppResult<(Vec<EventLog>, i64)> {
+        let where_sql = match member_id {
+            Some(_) => "WHERE member_id = ?1".to_string(),
+            None => String::new(),
+        };
+        let total_args: Vec<Arg> = match member_id {
+            Some(m) => vec![Arg::Text(m.to_string())],
+            None => vec![],
+        };
+        let total: i64 = count_row(&self.0,
+            &format!("SELECT COUNT(*) FROM event_log {where_sql}"), total_args).await?;
+        let sql = if member_id.is_some() {
+            "SELECT id, member_id, event_id, result, mileage, income, at FROM event_log WHERE member_id = ?1 ORDER BY at DESC LIMIT ?2 OFFSET ?3"
+        } else {
+            "SELECT id, member_id, event_id, result, mileage, income, at FROM event_log ORDER BY at DESC LIMIT ?1 OFFSET ?2"
+        };
+        let args: Vec<Arg> = if member_id.is_some() {
+            vec![Arg::Text(member_id.unwrap().to_string()), Arg::Num(take), Arg::Num(skip)]
+        } else {
+            vec![Arg::Num(take), Arg::Num(skip)]
+        };
+        let rows = raw_rows(&self.0, sql, args, 7).await?;
+        let mut out = Vec::new();
+        for row in rows {
+            if row.len() < 7 { continue; }
+            out.push(EventLog {
+                id: js_str(&row[0]), member_id: js_str(&row[1]), event_id: js_str(&row[2]),
+                result: js_str(&row[3]),
+                mileage: js_opt_i64(&row[4]), income: js_opt_i64(&row[5]),
+                at: str_to_dt(&js_str(&row[6])).unwrap_or_else(|_| Utc::now()),
+            });
+        }
+        Ok((out, total))
+    }
+
+    async fn insert_event_log(&self, e: &EventLog) -> AppResult<()> {
+        exec(&self.0, "INSERT INTO event_log (id,member_id,event_id,result,mileage,income,at) VALUES (?,?,?,?,?,?,?)",
+            vec![Arg::Text(e.id.clone()), Arg::Text(e.member_id.clone()), Arg::Text(e.event_id.clone()),
+                 Arg::Text(e.result.clone()), Arg::Num(e.mileage.unwrap_or(0)), Arg::Num(e.income.unwrap_or(0)),
+                 Arg::Text(dt_to_str(&e.at))]).await
+    }
+
+    async fn list_leaderboard(&self, take: i64, skip: i64) -> AppResult<(Vec<(String, String, Option<String>, i64)>, i64)> {
+        let total: i64 = count_row(&self.0, "SELECT COUNT(*) FROM member WHERE status != 'left'", vec![]).await?;
+        let sql = "SELECT m.id, m.user_id, m.plate, m.points FROM member m WHERE m.status != 'left' ORDER BY m.points DESC, m.joined_at ASC LIMIT ?1 OFFSET ?2";
+        let rows = raw_rows(&self.0, sql, vec![Arg::Num(take), Arg::Num(skip)], 4).await?;
+        let mut out = Vec::new();
+        for row in &rows {
+            if row.len() < 4 { continue; }
+            out.push((js_str(&row[0]), js_str(&row[1]), js_opt_str(&row[2]), row[3].as_f64().unwrap_or(0.0) as i64));
+        }
+        Ok((out, total))
+    }
+
+    // ---------- P1: 积分 ----------
+
+    async fn get_points_rule(&self, trigger: &str, scope: &str) -> AppResult<Option<PointsRule>> {
+        let sql = "SELECT id,trigger,points,scope FROM points_rule WHERE trigger=?1 AND scope=?2";
+        let rows = raw_rows(&self.0, sql, vec![Arg::Text(trigger.to_string()), Arg::Text(scope.to_string())], 4).await?;
+        if rows.is_empty() { return Ok(None); }
+        let r = &rows[0];
+        Ok(Some(PointsRule {
+            id: js_str(&r[0]), trigger: js_str(&r[1]),
+            points: r[2].as_f64().unwrap_or(0.0) as i64,
+            scope: js_str(&r[3]),
+        }))
+    }
+
+    async fn upsert_points_rule(&self, r: &PointsRule) -> AppResult<()> {
+        let sql = "INSERT INTO points_rule (id,trigger,points,scope) VALUES (?1,?2,?3,?4)
+                   ON CONFLICT(trigger,scope) DO UPDATE SET points=excluded.points, id=excluded.id";
+        exec(&self.0, sql, vec![Arg::Text(r.id.clone()), Arg::Text(r.trigger.clone()), Arg::Num(r.points), Arg::Text(r.scope.clone())]).await
+    }
+
+    async fn bump_member_points(&self, member_id: &str, delta: i64) -> AppResult<()> {
+        let sql = "UPDATE member SET points = points + ?1 WHERE id=?2";
+        exec(&self.0, sql, vec![Arg::Num(delta), Arg::Text(member_id.to_string())]).await
+    }
+
+    // ---------- P1: 统计 ----------
+
+    async fn count_members(&self) -> AppResult<i64> {
+        self.scalar_count("SELECT COUNT(*) FROM member").await
+    }
+    async fn count_active_members(&self) -> AppResult<i64> {
+        self.scalar_count("SELECT COUNT(*) FROM member WHERE status='Active'").await
+    }
+    async fn count_saves(&self) -> AppResult<i64> {
+        self.scalar_count("SELECT COUNT(*) FROM save_file").await
+    }
+    async fn count_total_downloads(&self) -> AppResult<i64> {
+        self.scalar_count("SELECT COALESCE(SUM(downloads),0) FROM save_file").await
+    }
+    async fn count_events(&self) -> AppResult<i64> {
+        self.scalar_count("SELECT COUNT(*) FROM \"event\"").await
+    }
+    async fn count_active_events(&self) -> AppResult<i64> {
+        self.scalar_count("SELECT COUNT(*) FROM \"event\" WHERE status IN ('scheduled','active')").await
+    }
+    async fn count_announcements(&self) -> AppResult<i64> {
+        self.scalar_count("SELECT COUNT(*) FROM announcement WHERE status='published'").await
+    }
+    async fn count_downloads_since(&self, days: i64) -> AppResult<i64> {
+        let cutoff = (Utc::now() - chrono::Duration::days(days)).format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        self.scalar_count_param("SELECT COALESCE(SUM(downloads),0) FROM save_file WHERE created_at >= ?1", &cutoff).await
+    }
+    async fn count_logins_since(&self, days: i64) -> AppResult<i64> {
+        let cutoff = (Utc::now() - chrono::Duration::days(days)).format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        self.scalar_count_param("SELECT COUNT(DISTINCT id) FROM \"user\" WHERE last_login >= ?1", &cutoff).await
+    }
+
+    // ---------- P1: RSS ----------
+
+    async fn list_scs_posts(&self, source: Option<&str>, game_version: Option<&str>, take: i64, skip: i64) -> AppResult<(Vec<ScsPost>, i64)> {
+        let mut where_parts: Vec<String> = vec!["1=1".into()];
+        let mut vals: Vec<Arg> = vec![];
+        if let Some(s) = source {
+            where_parts.push("source=?1".to_string());
+            vals.push(Arg::Text(String::from(s)));
+        }
+        if let Some(v) = game_version {
+            where_parts.push("game_version_tag=?2".to_string());
+            vals.push(Arg::Text(String::from(v)));
+        }
+        let where_sql = where_parts.join(" AND ");
+        let total: i64 = {
+            let sql = format!("SELECT COUNT(*) FROM scs_post WHERE {where_sql}");
+            let rows = raw_rows(&self.0, &sql, vals.clone(), 1).await?;
+            rows.first().and_then(|r| r.first().and_then(|v| v.as_f64())).unwrap_or(0.0) as i64
+        };
+        let sel_sql = format!(
+            "SELECT id,source,title,url,date,tags,game_version_tag,fetched_at
+             FROM scs_post WHERE {where_sql} ORDER BY date DESC LIMIT ?{} OFFSET ?{}",
+            vals.len() + 1, vals.len() + 2);
+        let mut all_vals = vals;
+        all_vals.push(Arg::Num(take));
+        all_vals.push(Arg::Num(skip));
+        let rows = raw_rows(&self.0, &sel_sql, all_vals, 8).await?;
+        let out: Vec<ScsPost> = rows.iter().map(|r| ScsPost {
+            id: js_str(&r[0]), source: js_str(&r[1]), title: js_str(&r[2]), url: js_str(&r[3]),
+            date: dt_opt(&js_str(&r[4])).unwrap_or_else(|| Utc::now()),
+            tags: js_opt_str(&r[5]).unwrap_or_default(),
+            game_version_tag: js_opt_str(&r[6]),
+            fetched_at: dt_opt(&js_str(&r[7])).unwrap_or_else(|| Utc::now()),
+        }).collect();
+        Ok((out, total))
+    }
+
+    async fn upsert_scs_post(&self, p: &ScsPost) -> AppResult<()> {
+        let sql = "INSERT INTO scs_post (id,source,title,url,date,tags,game_version_tag,fetched_at)
+                   VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+                   ON CONFLICT(url) DO UPDATE SET title=excluded.title, date=excluded.date,
+                   tags=excluded.tags, game_version_tag=excluded.game_version_tag";
+        let gvt = p.game_version_tag.clone().map(Arg::Text).unwrap_or(Arg::Null);
+        exec(&self.0, sql, vec![
+            Arg::Text(p.id.clone()), Arg::Text(p.source.clone()), Arg::Text(p.title.clone()), Arg::Text(p.url.clone()),
+            Arg::Text(dt_to_str(&p.date)), Arg::Text(p.tags.clone()),
+            gvt,
+            Arg::Text(dt_to_str(&p.fetched_at)),
+        ]).await
     }
 }
 
@@ -824,6 +1015,17 @@ CREATE TABLE IF NOT EXISTS "event" (
 CREATE TABLE IF NOT EXISTS audit_log (
   id TEXT PRIMARY KEY, actor TEXT, action TEXT, target TEXT, ip TEXT, detail TEXT, at TEXT
 );
+ CREATE TABLE IF NOT EXISTS event_log (
+  id TEXT PRIMARY KEY, member_id TEXT, event_id TEXT, result TEXT,
+  mileage INTEGER, income INTEGER, at TEXT
+ );
+ CREATE TABLE IF NOT EXISTS points_rule (
+   id TEXT PRIMARY KEY, trigger TEXT, points INTEGER, scope TEXT
+  );
+ CREATE TABLE IF NOT EXISTS scs_post (
+   id TEXT PRIMARY KEY, source TEXT, title TEXT, url TEXT UNIQUE,
+   date TEXT, tags TEXT, game_version_tag TEXT, fetched_at TEXT
+  );
 "#;
 
 /// 启动时建表（idempotent）。

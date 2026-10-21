@@ -17,13 +17,27 @@
 //! 每个请求各自持有 `Arc<RateLimiter>`，`RefCell` 借用是请求内瞬时的，CF 单线程天然安全。
 
 use crate::error::{AppError, AppResult};
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::Duration;
 
+// 双目标门控：
+// - native（Docker axum 多线程）：`RwLock`，`Send + Sync`，满足 axum state 要求。
+// - wasm（CF Workers 单线程）：`RefCell`（零锁，`wasm32-unknown-unknown` 无 multi-thread，
+//   `RwLock`/`Mutex` 会走平台锁路径 → abort）。`RefCell` 编译期 `Sync`（std 有
+//   `unsafe impl<T: ?Sized> Sync for RefCell<T>`），`&self` 签名不用改。
+#[cfg(not(feature = "worker"))]
+type MapLock = std::sync::RwLock<HashMap<String, (u64, u32)>>;
+#[cfg(feature = "worker")]
+type MapLock = std::cell::RefCell<HashMap<String, (u64, u32)>>;
+
+#[cfg(not(feature = "worker"))]
+fn map_new() -> MapLock { std::sync::RwLock::new(HashMap::new()) }
+#[cfg(feature = "worker")]
+fn map_new() -> MapLock { std::cell::RefCell::new(HashMap::new()) }
+
 pub struct RateLimiter {
     /// key → (窗口起始毫秒, 计数)
-    map: RefCell<HashMap<String, (u64, u32)>>,
+    map: MapLock,
 }
 
 impl Default for RateLimiter {
@@ -34,7 +48,7 @@ impl Default for RateLimiter {
 
 impl RateLimiter {
     pub fn new() -> Self {
-        RateLimiter { map: RefCell::new(HashMap::new()) }
+        RateLimiter { map: map_new() }
     }
 
     /// ★ 时钟源：**`chrono::Utc::now().timestamp_millis()`**（wasm 下经 workspace `chrono`
@@ -53,12 +67,27 @@ impl RateLimiter {
         let key = format!("{ip}|{username}");
         let now = Self::now_ms();
         let window_ms = window.as_millis() as u64;
+        self.hit_locked(&key, now, window_ms, limit)
+    }
+
+    #[cfg(not(feature = "worker"))]
+    fn hit_locked(&self, key: &str, now: u64, window_ms: u64, limit: u32) -> AppResult<()> {
+        let mut map = self.map.write().map_err(|_| anyhow::anyhow!("限流锁不可用"))?;
+        Self::count(&mut map, key, now, window_ms, limit)
+    }
+
+    #[cfg(feature = "worker")]
+    fn hit_locked(&self, key: &str, now: u64, window_ms: u64, limit: u32) -> AppResult<()> {
         let mut map = self.map.borrow_mut();
+        Self::count(map, key, now, window_ms, limit)
+    }
+
+    fn count(map: &mut HashMap<String, (u64, u32)>, key: &str, now: u64, window_ms: u64, limit: u32) -> AppResult<()> {
         // 惰性清理
         if map.len() > 10_000 {
             map.retain(|_, (t, _)| now.saturating_sub(*t) < window_ms);
         }
-        let e = map.entry(key).or_insert((now, 0));
+        let e = map.entry(key.to_string()).or_insert((now, 0));
         if now.saturating_sub(e.0) > window_ms {
             *e = (now, 0);
         }

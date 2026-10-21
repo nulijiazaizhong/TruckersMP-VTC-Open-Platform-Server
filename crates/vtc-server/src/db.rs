@@ -8,8 +8,8 @@ use rusqlite::{params, Connection, Row, Result as SqliteResult};
 use std::sync::Mutex;
 use vtc_core::backend::Db;
 use vtc_core::domain::{
-    Announcement, AuditLog, DlcEntry, DlcReport, DlcState, Event, Member, RefreshToken, SaveFile,
-    SaveRelease, Team, User,
+    Announcement, AuditLog, DlcEntry, DlcReport, DlcState, Event, EventLog, Member, PointsRule,
+    RefreshToken, SaveFile, SaveRelease, ScsPost, Team, User,
 };
 use vtc_core::error::{AppError, AppResult};
 
@@ -97,6 +97,17 @@ CREATE TABLE IF NOT EXISTS "event" (
 CREATE TABLE IF NOT EXISTS audit_log (
   id TEXT PRIMARY KEY, actor TEXT, action TEXT, target TEXT, ip TEXT, detail TEXT, at TEXT
 );
+ CREATE TABLE IF NOT EXISTS event_log (
+  id TEXT PRIMARY KEY, member_id TEXT, event_id TEXT, result TEXT,
+  mileage INTEGER, income INTEGER, at TEXT
+ );
+ CREATE TABLE IF NOT EXISTS points_rule (
+   id TEXT PRIMARY KEY, trigger TEXT, points INTEGER, scope TEXT
+  );
+ CREATE TABLE IF NOT EXISTS scs_post (
+   id TEXT PRIMARY KEY, source TEXT, title TEXT, url TEXT UNIQUE,
+   date TEXT, tags TEXT, game_version_tag TEXT, fetched_at TEXT
+  );
 "#,
         )?;
         Ok(())
@@ -151,6 +162,19 @@ fn save_from_row(r: &Row) -> SqliteResult<SaveFile> {
         downloads: r.get(8)?,
         created_at: str_to_dt(&r.get::<_, String>(9)?).unwrap_or_else(|_| Utc::now()),
         created_by: r.get(10)?,
+    })
+}
+
+/// EventLog 行映射（free fn，供 `list_event_logs` 的 `query_map` 闭包使用）
+fn event_log_from_row(r: &Row) -> SqliteResult<EventLog> {
+    Ok(EventLog {
+        id: r.get(0)?,
+        member_id: r.get(1)?,
+        event_id: r.get(2)?,
+        result: r.get(3)?,
+        mileage: r.get(4)?,
+        income: r.get(5)?,
+        at: str_to_dt(&r.get::<_, String>(6)?).unwrap_or_else(|_| Utc::now()),
     })
 }
 
@@ -666,6 +690,197 @@ impl Db for SqliteDb {
                      t.default_lang, t.feature_allow_upload as i64, t.feature_tmp_binding as i64,
                      t.feature_rss_enabled as i64, dt_to_str(&t.created_at)])
             .map_err(|e| AppError::Internal(e.into()))?;
+        Ok(())
+    }
+
+    // ---------- EventLog（C7 活动记录） ----------
+
+    async fn list_event_logs(&self, member_id: Option<&str>, take: i64, skip: i64) -> AppResult<(Vec<EventLog>, i64)> {
+        let conn = self.lock();
+        let where_clause = if let Some(m) = member_id {
+            "member_id = ?1".to_string()
+        } else { String::new() };
+        let total: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM event_log WHERE {}", if where_clause.is_empty() { "1=1".into() } else { where_clause.clone() }),
+            rusqlite::params![member_id], |r| r.get(0)).map_err(|e| AppError::Internal(e.into()))?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT el.id, el.member_id, el.event_id, el.result, el.mileage, el.income, el.at
+             FROM event_log el WHERE {} ORDER BY el.at DESC LIMIT ? OFFSET ?",
+            if where_clause.is_empty() { "1=1".into() } else { where_clause })).map_err(|e| AppError::Internal(e.into()))?;
+        let rows = stmt.query_map(rusqlite::params![member_id, take, skip], |r| event_log_from_row(r))
+            .map_err(|e| AppError::Internal(e.into()))?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r.map_err(|e| AppError::Internal(e.into()))?); }
+        Ok((out, total))
+    }
+
+    async fn insert_event_log(&self, e: &EventLog) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute("INSERT INTO event_log (id,member_id,event_id,result,mileage,income,at) VALUES (?,?,?,?,?,?,?)",
+            params![e.id, e.member_id, e.event_id, e.result, e.mileage, e.income, dt_to_str(&e.at)])
+            .map_err(|e| AppError::Internal(e.into()))?;
+        Ok(())
+    }
+
+    /// 排行榜：按积分降序（C11）
+    async fn list_leaderboard(&self, take: i64, skip: i64) -> AppResult<(Vec<(String, String, Option<String>, i64)>, i64)> {
+        let conn = self.lock();
+        let total: i64 = conn.query_row("SELECT COUNT(*) FROM member WHERE status != 'left'", [], |r| r.get(0))
+            .map_err(|e| AppError::Internal(e.into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.user_id, m.plate, m.points FROM member m
+             WHERE m.status != 'left' ORDER BY m.points DESC, m.joined_at ASC LIMIT ? OFFSET ?")
+            .map_err(|e| AppError::Internal(e.into()))?;
+        let rows = stmt.query_map(params![take, skip], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, i64>(3)?))
+        }).map_err(|e| AppError::Internal(e.into()))?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r.map_err(|e| AppError::Internal(e.into()))?); }
+        Ok((out, total))
+    }
+
+    // ---------- P1: 积分 ----------
+
+    async fn get_points_rule(&self, trigger: &str, scope: &str) -> AppResult<Option<PointsRule>> {
+        let conn = self.lock();
+        let mut s = conn.prepare("SELECT id,trigger,points,scope FROM points_rule WHERE trigger=? AND scope=?")
+            .map_err(|e| AppError::Internal(e.into()))?;
+        let mut rows = s.query_map(params![trigger, scope], |r| Ok(PointsRule {
+            id: r.get(0)?, trigger: r.get(1)?, points: r.get(2)?, scope: r.get(3)?,
+        })).map_err(|e| AppError::Internal(e.into()))?;
+        let v = match rows.next() {
+            Some(Ok(r)) => Some(r),
+            Some(Err(e)) => return Err(AppError::Internal(e.into())),
+            None => None,
+        };
+        Ok(v)
+    }
+
+    async fn upsert_points_rule(&self, r: &PointsRule) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO points_rule (id,trigger,points,scope) VALUES (?,?,?,?)
+             ON CONFLICT(trigger,scope) DO UPDATE SET points=excluded.points, id=excluded.id",
+            params![r.id, r.trigger, r.points, r.scope],
+        ).map_err(|e| AppError::Internal(e.into()))?;
+        Ok(())
+    }
+
+    async fn bump_member_points(&self, member_id: &str, delta: i64) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute("UPDATE member SET points = points + ? WHERE id=?", params![delta, member_id])
+            .map_err(|e| AppError::Internal(e.into()))?;
+        Ok(())
+    }
+
+    // ---------- P1: 统计 ----------
+
+    async fn count_members(&self) -> AppResult<i64> {
+        let conn = self.lock();
+        conn.query_row("SELECT COUNT(*) FROM member", [], |r| r.get(0))
+            .map_err(|e| AppError::Internal(e.into()))
+    }
+
+    async fn count_active_members(&self) -> AppResult<i64> {
+        let conn = self.lock();
+        conn.query_row("SELECT COUNT(*) FROM member WHERE status='Active'", [], |r| r.get(0))
+            .map_err(|e| AppError::Internal(e.into()))
+    }
+
+    async fn count_saves(&self) -> AppResult<i64> {
+        let conn = self.lock();
+        conn.query_row("SELECT COUNT(*) FROM save_file", [], |r| r.get(0))
+            .map_err(|e| AppError::Internal(e.into()))
+    }
+
+    async fn count_total_downloads(&self) -> AppResult<i64> {
+        let conn = self.lock();
+        conn.query_row("SELECT COALESCE(SUM(downloads),0) FROM save_file", [], |r| r.get(0))
+            .map_err(|e| AppError::Internal(e.into()))
+    }
+
+    async fn count_events(&self) -> AppResult<i64> {
+        let conn = self.lock();
+        conn.query_row("SELECT COUNT(*) FROM \"event\"", [], |r| r.get(0))
+            .map_err(|e| AppError::Internal(e.into()))
+    }
+
+    async fn count_active_events(&self) -> AppResult<i64> {
+        let conn = self.lock();
+        conn.query_row("SELECT COUNT(*) FROM \"event\" WHERE status IN ('scheduled','active')", [], |r| r.get(0))
+            .map_err(|e| AppError::Internal(e.into()))
+    }
+
+    async fn count_announcements(&self) -> AppResult<i64> {
+        let conn = self.lock();
+        conn.query_row("SELECT COUNT(*) FROM announcement WHERE status='published'", [], |r| r.get(0))
+            .map_err(|e| AppError::Internal(e.into()))
+    }
+
+    async fn count_downloads_since(&self, days: i64) -> AppResult<i64> {
+        let conn = self.lock();
+        let cutoff = (Utc::now() - chrono::Duration::days(days)).format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        conn.query_row(
+            "SELECT COALESCE(SUM(downloads),0) FROM save_file WHERE created_at >= ?",
+            params![cutoff], |r| r.get(0),
+        ).map_err(|e| AppError::Internal(e.into()))
+    }
+
+    async fn count_logins_since(&self, days: i64) -> AppResult<i64> {
+        let conn = self.lock();
+        let cutoff = (Utc::now() - chrono::Duration::days(days)).format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        conn.query_row(
+            "SELECT COUNT(DISTINCT id) FROM \"user\" WHERE last_login >= ?",
+            params![cutoff], |r| r.get(0),
+        ).map_err(|e| AppError::Internal(e.into()))
+    }
+
+    // ---------- P1: RSS ----------
+
+    async fn list_scs_posts(&self, source: Option<&str>, game_version: Option<&str>, take: i64, skip: i64) -> AppResult<(Vec<ScsPost>, i64)> {
+        let conn = self.lock();
+        let mut where_parts: Vec<String> = vec!["1=1".into()];
+        let mut vals: Vec<Box<dyn rusqlite::ToSql>> = vec![];
+        if let Some(s) = source { where_parts.push("source=?".to_string()); vals.push(Box::new(s.to_string())); }
+        if let Some(v) = game_version { where_parts.push("game_version_tag=?".to_string()); vals.push(Box::new(v.to_string())); }
+        let where_sql = where_parts.join(" AND ");
+        let total: i64 = {
+            let mut stmt = conn.prepare(&format!("SELECT COUNT(*) FROM scs_post WHERE {where_sql}"))
+                .map_err(|e| AppError::Internal(e.into()))?;
+            let p: Vec<&dyn rusqlite::ToSql> = vals.iter().map(|b| b.as_ref()).collect();
+            stmt.query_row(rusqlite::params_from_iter(p), |r| r.get(0))
+                .map_err(|e| AppError::Internal(e.into()))?
+        };
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id,source,title,url,date,tags,game_version_tag,fetched_at
+             FROM scs_post WHERE {where_sql} ORDER BY date DESC LIMIT ? OFFSET ?"))
+            .map_err(|e| AppError::Internal(e.into()))?;
+        let mut p: Vec<Box<dyn rusqlite::ToSql>> = vals;
+        p.push(Box::new(take)); p.push(Box::new(skip));
+        let rows: Vec<ScsPost> = stmt.query_map(
+            rusqlite::params_from_iter(p.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql)),
+            |r| Ok(ScsPost {
+                id: r.get(0)?, source: r.get(1)?, title: r.get(2)?, url: r.get(3)?,
+                date: str_to_dt(&r.get::<_,String>(4)?).unwrap_or_else(|_| Utc::now()),
+                tags: r.get::<_,Option<String>>(5)?.unwrap_or_default(),
+                game_version_tag: r.get(6)?,
+                fetched_at: str_to_dt(&r.get::<_,String>(7)?).unwrap_or_else(|_| Utc::now()),
+            }),
+        ).map_err(|e| AppError::Internal(e.into()))?
+            .collect::<Result<Vec<_>,_>>().map_err(|e| AppError::Internal(e.into()))?;
+        Ok((rows, total))
+    }
+
+    async fn upsert_scs_post(&self, p: &ScsPost) -> AppResult<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO scs_post (id,source,title,url,date,tags,game_version_tag,fetched_at)
+             VALUES (?,?,?,?,?,?,?,?)
+             ON CONFLICT(url) DO UPDATE SET title=excluded.title, date=excluded.date,
+             tags=excluded.tags, game_version_tag=excluded.game_version_tag",
+            params![p.id, p.source, p.title, p.url, dt_to_str(&p.date), p.tags,
+                     p.game_version_tag, dt_to_str(&p.fetched_at)],
+        ).map_err(|e| AppError::Internal(e.into()))?;
         Ok(())
     }
 }

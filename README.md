@@ -1,6 +1,7 @@
 # VTC 后端 · Rust
 
 > 一份核心代码，**双目标编译**成两个后端：
+>
 > - **Docker 自部署**（Axum + SQLite + 本地存储 + 内存推送）
 > - **Cloudflare Workers**（worker-rs + D1 + R2）
 >
@@ -35,16 +36,16 @@ CF 注入 D1/R2，业务逻辑零重写。
 
 ## 形态对照（同一份 service，两种后端）
 
-| 关注点 | Docker 形态（`vtc-server`） | CF Workers 形态（`vtc-worker`） |
-|---|---|---|
-| 数据库 | SQLite（`rusqlite`，本地文件 `vtc.db`） | **D1**（CF 托管，`db::D1Db` 实现 `Db`） |
-| 对象存储 | 本地磁盘（`LocalStorage`） | **R2**（`R2Storage`；预签名 URL → worker 中转 HMAC 签名） |
-| DLC 模板 | 本地 `map-dlc/*.txt` 文件 | **R2 `dlc-templates/*.txt`**（`parse_template` 解析，可后传） |
-| 建表/种子 | 启动时 `bootstrap::seed`（SQLite 自动迁移） | **首次访问自愈** `ensure_ready`（自动建表 + seed，免手动） |
-| 推送 | 内存 `InMemPush`（存根） | P1 接 Durable Objects（P0 内存占位） |
-| 路由 | Axum（`{id}` 模板） | `match (path, method)` 段解析（无 axum） |
-| async | `#[async_trait]`（Send） | `#[async_trait(?Send)]`（wasm 单线程） |
-| 部署 | `docker compose up` | **Cloudflare「连接 GitHub 仓库」**（push main 自动构建部署） |
+| 关注点    | Docker 形态（`vtc-server`）                 | CF Workers 形态（`vtc-worker`）                               |
+| --------- | ------------------------------------------- | ------------------------------------------------------------- |
+| 数据库    | SQLite（`rusqlite`，本地文件 `vtc.db`）     | **D1**（CF 托管，`db::D1Db` 实现 `Db`）                       |
+| 对象存储  | 本地磁盘（`LocalStorage`）                  | **R2**（`R2Storage`；预签名 URL → worker 中转 HMAC 签名）     |
+| DLC 模板  | 本地 `map-dlc/*.txt` 文件                   | **R2 `dlc-templates/*.txt`**（`parse_template` 解析，可后传） |
+| 建表/种子 | 启动时 `bootstrap::seed`（SQLite 自动迁移） | **首次访问自愈** `ensure_ready`（自动建表 + seed，免手动）    |
+| 推送      | 内存 `InMemPush`（存根）                    | P1 接 Durable Objects（P0 内存占位）                          |
+| 路由      | Axum（`{id}` 模板）                         | `match (path, method)` 段解析（无 axum）                      |
+| async     | `#[async_trait]`（Send）                    | `#[async_trait(?Send)]`（wasm 单线程）                        |
+| 部署      | `docker compose up`                         | **Cloudflare「连接 GitHub 仓库」**（push main 自动构建部署）  |
 
 ---
 
@@ -83,6 +84,7 @@ curl http://127.0.0.1:8731/api/v1/health   # 返回 ok / {"code":0} 即启动成
 cargo build -p vtc-server --release
 # 产物：target/release/vtc-server
 ```
+
 </details>
 
 ## ② Cloudflare Workers
@@ -114,21 +116,22 @@ worker 形态**零 C 依赖**（D1/R2 走 CF 托管，无 SQLite、无本地存�
 4. 选仓库 **`nulijiazaizhong/TruckersMP-VTC-Open-Platform-Server`**、分支 **`main`**。
 5. 在「设置应用程序」页按下表填（CF 默认值按 Node 项目预设，对 Rust 仓库全部要改）：
 
-| 表单字段 | 填什么 | 说明 |
-|---|---|---|
-| **项目名称** | `vtc-server` | 建议与 worker 名一致（非必须）。 |
-| **构建命令** | 见下方「构建命令」整段 | CF 镜像无 Rust，**必须**现场装 rustup + wasm target，再跑仓库自带 `cf-build.sh`。 |
-| **部署命令** | 见下方「部署命令」整段 | 装 wrangler、在产物目录 `dist/` 里 `wrangler deploy`。 |
-| **预览命令** | `npm i -g wrangler@4 && cd crates/vtc-worker/dist && wrangler preview` | 必填（CF 表单不允许空）。仅本地调试用，**不影响正式部署**。worker-rs 本地预览可能因 `nodejs_compat` 模拟不完美报错，**报错也不影响 `wrangler deploy` 上线**，可忽略。 |
-| **启用预览构建** | **关** | 不需要 CI 跑预览。 |
-| **使用 Cloudflare Access 保护** | **关** | API 服务不用，需要时再开。 |
-| **高级设置** | 默认即可 | 不填也行。 |
+| 表单字段                        | 填什么                                                                 | 说明                                                                                                                                                                  |
+| ------------------------------- | ---------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **项目名称**                    | `vtc-server`                                                           | 建议与 worker 名一致（非必须）。                                                                                                                                      |
+| **构建命令**                    | 见下方「构建命令」整段                                                 | CF 镜像无 Rust，**必须**现场装 rustup + wasm target，再跑仓库自带 `cf-build.sh`。                                                                                     |
+| **部署命令**                    | 见下方「部署命令」整段                                                 | 装 wrangler、在产物目录 `dist/` 里 `wrangler deploy`。                                                                                                                |
+| **预览命令**                    | `npm i -g wrangler@4 && cd crates/vtc-worker/dist && wrangler preview` | 必填（CF 表单不允许空）。仅本地调试用，**不影响正式部署**。worker-rs 本地预览可能因 `nodejs_compat` 模拟不完美报错，**报错也不影响 `wrangler deploy` 上线**，可忽略。 |
+| **启用预览构建**                | **关**                                                                 | 不需要 CI 跑预览。                                                                                                                                                    |
+| **使用 Cloudflare Access 保护** | **关**                                                                 | API 服务不用，需要时再开。                                                                                                                                            |
+| **高级设置**                    | 默认即可                                                               | 不填也行。                                                                                                                                                            |
 
 **构建命令**（整段粘贴）——装 Rust + wasm target，再跑仓库自带脚本。
 ⚠ **CF Builds 用 `/bin/sh`（dash）执行，不是 bash**：`source` 是 bash 内建，dash 不认
 （会报 `source: not found` 直接崩）。本命令直接改 `PATH` 指向 cargo bin，最稳。
 `cf-build.sh` 会 build 并把产物（`worker.js` + `index.js` + `index_bg.wasm` + 干净 `wrangler.jsonc`）
 拷进 `dist/`——两个入口文件必须都在，否则 CF 当成「静态 Worker」绑不上 D1/R2：
+
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
   && export PATH="$HOME/.cargo/bin:$PATH" \
@@ -141,6 +144,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profil
 `main: worker.js`，D1/R2 按 `database_name`/`bucket_name` 名字引用（wrangler v4 语法，
 `CF_USE_REMOTE_CONFIG` 场景下再用 `--remote-config` 覆盖）。**不要**再 `cp` 仓库根目录那份
 `wrangler.jsonc`（它带 `build` 字段和 `<D1_DATABASE_ID>`/`<ZONE_ID>` 占位符，deploy 会失败）：
+
 ```bash
 npm i -g wrangler@4 \
   && cd crates/vtc-worker/dist \
@@ -157,7 +161,7 @@ npm i -g wrangler@4 \
 1. **Bindings**（资源绑定）——名字必须**精确**全大写：
    - **Add D1 database** → 绑定名 **`DB`** → 选第 1 步建的 `vtc`。
    - **Add R2 bucket** → 绑定名 **`BUCKET`** → 选第 1 步建的 `vtc-saves`。
-   > 代码按 `env.d1("DB")` / `env.get_binding("BUCKET")` 取，名字对不上运行时报「binding 未找到」。
+     > 代码按 `env.d1("DB")` / `env.get_binding("BUCKET")` 取，名字对不上运行时报「binding 未找到」。
 2. **Variables and Secrets**：
    - **Variables**（非机密）：`TEAM_NAME`=默认车队、`UPDATE_CHANNEL`=stable、
      `PUBLIC_BASE`=你的正式域名（如 `https://vtc.yean.team`）、`AUTH_REQUIRE_TMP`=false、`AUTH_REQUIRE_STEAM`=false。
@@ -215,6 +219,7 @@ Docker/axum 的 `Handler` 要求 future 是 **Send**；Cloudflare worker 的 D1/
 `Rc`/`Arc<D1Database>`（**非 Send**，wasm 单线程）。二者无法共享同一套 `Arc<dyn Db>`。
 
 **解法（已实现）**：
+
 1. **service 层全部泛型**——`ConfigService<D: Db>`、`SaveService<D: Db, S: Storage>` 等，
    持有具体 `Arc<D>`/`Arc<S>`，**不持 `Arc<dyn Db>`**。Send 边界由具体类型 + trait 的 Send 开关决定。
 2. **后端 trait 按 vtc-core 的 cargo feature `worker` 门控**（cargo feature 按依赖边生效）：

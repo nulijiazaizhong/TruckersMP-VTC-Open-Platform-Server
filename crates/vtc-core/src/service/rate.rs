@@ -79,7 +79,7 @@ impl RateLimiter {
     #[cfg(feature = "worker")]
     fn hit_locked(&self, key: &str, now: u64, window_ms: u64, limit: u32) -> AppResult<()> {
         let mut map = self.map.borrow_mut();
-        Self::count(map, key, now, window_ms, limit)
+        Self::count(&mut *map, key, now, window_ms, limit)
     }
 
     fn count(map: &mut HashMap<String, (u64, u32)>, key: &str, now: u64, window_ms: u64, limit: u32) -> AppResult<()> {
